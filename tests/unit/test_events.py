@@ -177,6 +177,28 @@ class TestEventWriter:
         assert "[REDACTED]" in p["error"]
         assert "mytoken" not in p["details"]
 
+    def test_redacts_complete_dotted_authorization_values(self, tmp_path: Path) -> None:
+        with EventWriter(tmp_path / "run") as writer:
+            writer.emit("test", {"error": "Authorization: Bearer abc.def"})
+
+        payload = _read_events(tmp_path / "run" / "events.jsonl")[0]["payload"]
+
+        assert payload["error"] == "Authorization: [REDACTED]"
+        assert "abc" not in payload["error"]
+        assert ".def" not in payload["error"]
+
+    def test_redacts_escaped_quoted_credential_values_without_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        with EventWriter(tmp_path / "run") as writer:
+            writer.emit("test", {"error": 'password="abc\\".def"'})
+
+        payload = _read_events(tmp_path / "run" / "events.jsonl")[0]["payload"]
+
+        assert payload["error"] == 'password="[REDACTED]"'
+        assert "abc" not in payload["error"]
+        assert ".def" not in payload["error"]
+
     def test_appends_to_existing_events_and_recovers_sequence(
         self, tmp_path: Path
     ) -> None:
@@ -327,6 +349,70 @@ class TestEventWriter:
             "BeArEr [REDACTED]; SK-[REDACTED] and Sk-[REDACTED] and "
             "sk-[REDACTED]"
         )
+
+    def test_redacts_bounded_free_form_key_value_credentials_recursively(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "message": (
+                "Authorization: Bearer secret-value; password=hunter2; "
+                "api_key: sk-free-form"
+            ),
+            "memory": {
+                "read": [
+                    {"text": "nested PASSWORD=secret-note and Api_Key: nested-key"}
+                ]
+            },
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+        }
+
+        with EventWriter(tmp_path / "run") as writer:
+            writer.emit("memory_operation", payload)
+
+        event = _read_events(tmp_path / "run" / "events.jsonl")[0]
+        redacted = event["payload"]
+        assert redacted["message"] == (
+            "Authorization: [REDACTED]; password=[REDACTED]; api_key: [REDACTED]"
+        )
+        assert redacted["memory"]["read"][0]["text"] == (
+            "nested PASSWORD=[REDACTED] and Api_Key: [REDACTED]"
+        )
+        assert redacted["usage"] == {"prompt_tokens": 4, "completion_tokens": 2}
+
+    def test_redacts_spaced_structured_keys_and_quoted_nested_values(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "values": {
+                "api key": "structured-api",
+                "client secret": "structured-client",
+                "secret_key": "structured-secret",
+            },
+            "memory": {
+                "read": [
+                    {"text": ('password="nested-password"; API.KEY: [nested-api]')}
+                ]
+            },
+            "message": "password=\"quoted-password\"; client.secret: 'quoted-client'",
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+
+        with EventWriter(tmp_path / "run") as writer:
+            writer.emit("memory_operation", payload)
+
+        redacted = _read_events(tmp_path / "run" / "events.jsonl")[0]["payload"]
+        assert redacted["values"] == {
+            "api key": "[REDACTED]",
+            "client secret": "[REDACTED]",
+            "secret_key": "[REDACTED]",
+        }
+        assert redacted["memory"]["read"][0]["text"] == (
+            'password="[REDACTED]"; API.KEY: [REDACTED]'
+        )
+        assert redacted["message"] == (
+            "password=\"[REDACTED]\"; client.secret: '[REDACTED]'"
+        )
+        assert redacted["usage"] == {"prompt_tokens": 3, "completion_tokens": 2}
 
 
 def _read_events(path: Path) -> list[dict]:

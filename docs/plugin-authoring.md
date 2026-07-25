@@ -31,6 +31,13 @@ class MyGame:
     def player_ids(self) -> list[str]:
         return ["player-1", "player-2"]
 
+    def player_ids_from_config(self, game_config: JsonObject) -> list[str]:
+        return self.player_ids
+
+    def validate_config(self, game_config: JsonObject) -> None:
+        # Reject invalid game-specific values before providers are constructed.
+        return None
+
     def system_prompt(self, actor_id: str) -> str:
         return f"You are {actor_id}. Call 'act' when it is your turn."
 
@@ -104,15 +111,47 @@ passed unchanged to `create_session(seed=..., game_config=...)` for every
 match. Keep game-specific setup in this mapping and keep the authoritative
 state inside the session.
 
+Plugins that support configurable actors should implement
+`player_ids_from_config(game_config)` and return the actor IDs for that run.
+Implement `validate_config(game_config)` to reject malformed game settings
+before the CLI constructs any agents. The registry falls back to `player_ids`
+and skips validation for older plugins that do not provide these hooks.
+
 For multiple configured agents, each agent `id` is an actor ID from the
 plugin's `current_actor_id` values. The engine constructs every configured
 agent and dispatches each turn by that ID. A single configured agent remains a
 convenience fallback for games with one shared agent; a missing mapping in a
 multi-agent run is an explicit failed match.
+Plugins that expose `requires_exact_agent_ids = True` must receive exactly one
+agent for every configured actor, including when the engine is used directly.
 
 The run trace records each configured agent's `id`, `role`, `model`,
 `base_url`, `api_key_env`, `timeout`, and `max_completion_tokens`. It records
 the environment variable name, never the literal API key.
+
+The run configuration also records `max_memory_operations_per_turn`, the
+finite budget reserved for engine-owned memory operations.
+
+### Reserved Memory Tools
+
+The engine provides two reserved tools to every agent during a match:
+
+- `read_memory`: Returns the actor's private notes in chronological order.
+- `write_memory(text)`: Appends a free-form private note.
+
+Memory-only calls do not advance the game turn. The engine processes them and
+requests another model response. A final response must contain exactly one game
+action. Writes may accompany that action and are committed atomically -- if the
+game action is invalid, the writes are discarded. `read_memory` cannot be
+combined with the final action.
+
+Memory state is per-match and per-actor. Notes are never shared between agents
+or across matches.
+
+When a response contains several memory-only calls, the engine processes them
+in response order and counts each call against the memory budget. Writes paired
+with one game action are validated as a batch before the action and committed
+only after the action succeeds.
 
 ### Strict Observations
 
@@ -136,7 +175,9 @@ configured budget.
 
 `handle_failed_turn` is called when the model exhausts its invalid-action
 budget. Return `None` to let the engine end the match as failed, or return a
-`Transition` to apply a game-specific recovery.
+`Transition` to apply a game-specific recovery. A nonterminal recovery lets
+the engine continue the match; a terminal recovery is completed only when the
+session returns a completed result.
 
 ### No Raw State Exposure
 
@@ -166,3 +207,8 @@ The engine records these events for each turn:
 - `transition` - your plugin-supplied summary and metrics
 
 Credential-shaped fields are redacted before writing.
+
+Sessions may optionally expose `drain_hand_events()` to return public plugin
+events. The engine emits each event with match, turn, and actor context before
+the match result. Poker uses this for public `hand_start` and `hand_end`
+events; private hole cards must not appear in those payloads.

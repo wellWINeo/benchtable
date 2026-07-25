@@ -19,6 +19,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/benchtable"]
 
+[project.entry-points."benchtable.games"]
+poker = "benchtable.games.poker.session:PokerGame"
+
 [dependency-groups]
 dev = [
     "pytest>=8,<9",

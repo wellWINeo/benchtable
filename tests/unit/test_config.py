@@ -656,3 +656,96 @@ class TestLoadConfig:
 
         with pytest.raises(ConfigurationError):
             load_config(cfg_path)
+
+    def test_max_memory_operations_per_turn_default(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "p1"
+            model = "gpt-4o"
+        """)
+        )
+        cfg = load_config(cfg_path)
+        assert cfg.run.max_memory_operations_per_turn == 4
+
+    def test_max_memory_operations_per_turn_explicit(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_memory_operations_per_turn = 8
+
+            [[agents]]
+            id = "p1"
+            model = "gpt-4o"
+        """)
+        )
+        cfg = load_config(cfg_path)
+        assert cfg.run.max_memory_operations_per_turn == 8
+
+    def test_max_memory_operations_per_turn_zero(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_memory_operations_per_turn = 0
+
+            [[agents]]
+            id = "p1"
+            model = "gpt-4o"
+        """)
+        )
+        cfg = load_config(cfg_path)
+        assert cfg.run.max_memory_operations_per_turn == 0
+
+    @pytest.mark.parametrize("value", ["true", '"4"', "4.0"])
+    def test_max_memory_operations_per_turn_rejects_coercion(
+        self, tmp_path: Path, value: str
+    ) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent(
+                f"""\
+                [run]
+                game = "tiny"
+                matches = 1
+                max_memory_operations_per_turn = {value}
+
+                [[agents]]
+                id = "p1"
+                model = "gpt-4o"
+            """
+            )
+        )
+
+        with pytest.raises(ConfigurationError):
+            load_config(cfg_path)
+
+    def test_max_memory_operations_per_turn_rejects_negative(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_memory_operations_per_turn = -1
+
+            [[agents]]
+            id = "p1"
+            model = "gpt-4o"
+        """)
+        )
+
+        with pytest.raises(ConfigurationError):
+            load_config(cfg_path)

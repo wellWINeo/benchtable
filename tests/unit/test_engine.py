@@ -8,12 +8,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from tests.fixtures.fake_agent import FakeAgent
 from tests.fixtures.tiny_game import TinyGame
 
 from benchtable.contracts import ModelResponse, ToolCall, Usage
 from benchtable.engine import RunEngine
 from benchtable.errors import ProviderError
+from benchtable.games.poker.session import PokerGame
 
 
 def _read_events(path: Path) -> list[dict[str, Any]]:
@@ -425,6 +427,31 @@ class TestRunEngine:
         )
         assert not any(event["event_type"] == "provider_error" for event in events)
 
+    async def test_exact_mapping_is_enforced_for_direct_engine_use(
+        self, tmp_path: Path
+    ) -> None:
+        agent = FakeAgent(tool_name="poker_action")
+        engine = RunEngine(
+            game=PokerGame(),
+            agent=agent,
+            game_config={"players": ["alice", "bob"]},
+            run_dir=tmp_path / "run",
+            run_id="test-run",
+            max_turns=1,
+        )
+
+        result = await engine.run()
+
+        assert not result.success
+        assert agent.requests == []
+        events = _read_events(tmp_path / "run")
+        assert any(
+            event["event_type"] == "engine_error"
+            and event["payload"].get("error") == "exact_agent_mapping"
+            for event in events
+        )
+        assert not any(event["event_type"] == "model_request" for event in events)
+
     async def test_game_config_is_forwarded_to_session(self, tmp_path: Path) -> None:
         game = TinyGame()
         engine = RunEngine(
@@ -617,6 +644,41 @@ class TestRunEngine:
             for event in events
         )
 
+    async def test_nonterminal_recovery_continues_to_later_turns(
+        self, tmp_path: Path
+    ) -> None:
+        bad = ModelResponse(
+            assistant_text="No action.", tool_calls=[], finish_reason="stop"
+        )
+        good = ModelResponse(
+            assistant_text="Acting.",
+            tool_calls=[ToolCall(call_id="good", name="act", arguments={})],
+            finish_reason="stop",
+        )
+        game = TinyGame(max_actions=2, failed_turn_recovery=True)
+        engine = RunEngine(
+            game=game,
+            agent=FakeAgent(responses=[bad, good, good]),
+            run_dir=tmp_path / "run",
+            run_id="test-run",
+            max_turns=3,
+            max_invalid_attempts=0,
+        )
+
+        result = await engine.run()
+
+        assert result.success
+        assert (
+            len(
+                [
+                    event
+                    for event in _read_events(tmp_path / "run")
+                    if event["event_type"] == "transition"
+                ]
+            )
+            >= 3
+        )
+
     async def test_provider_failure_is_not_reported_as_plugin_failure(
         self, tmp_path: Path
     ) -> None:
@@ -690,6 +752,38 @@ class TestRunEngine:
             for event in events
         )
         assert not any(event["event_type"] == "provider_error" for event in events)
+
+    async def test_invalid_plugin_memory_limits_emit_match_failure(
+        self, tmp_path: Path
+    ) -> None:
+        class InvalidMemoryGame(TinyGame):
+            def create_session(self, *, seed: int, game_config: Any = None) -> Any:
+                session = super().create_session(seed=seed, game_config=game_config)
+                session.memory_max_entries = -1
+                return session
+
+        engine = RunEngine(
+            game=InvalidMemoryGame(),
+            agent=FakeAgent(tool_name="act"),
+            run_dir=tmp_path / "run",
+            run_id="invalid-memory-limits",
+            max_turns=1,
+        )
+
+        result = await engine.run()
+
+        assert not result.success
+        events = _read_events(tmp_path / "run")
+        assert any(
+            event["event_type"] == "engine_error"
+            and event["payload"].get("phase") == "memory_initialization"
+            for event in events
+        )
+        assert any(
+            event["event_type"] == "match_end"
+            and event["payload"].get("failure_reason") == "memory_initialization_failed"
+            for event in events
+        )
 
     async def test_turn_setup_failure_retains_known_actor_context(
         self, tmp_path: Path
@@ -1057,3 +1151,47 @@ class TestRunEngine:
             {"nested": {"value": 1}},
             {"nested": {"value": 1}},
         ]
+
+    async def test_max_memory_operations_per_turn_recorded_in_run_config(
+        self, tmp_path: Path
+    ) -> None:
+        engine = RunEngine(
+            game=TinyGame(),
+            agent=FakeAgent(tool_name="act"),
+            run_dir=tmp_path / "run",
+            run_id="test-run",
+            max_turns=1,
+            max_memory_operations_per_turn=6,
+        )
+
+        await engine.run()
+        events = _read_events(tmp_path / "run")
+        config = next(event for event in events if event["event_type"] == "run_config")
+
+        assert config["payload"]["max_memory_operations_per_turn"] == 6
+
+    async def test_max_memory_operations_per_turn_stored_on_engine(
+        self, tmp_path: Path
+    ) -> None:
+        engine = RunEngine(
+            game=TinyGame(),
+            agent=FakeAgent(tool_name="act"),
+            run_dir=tmp_path / "run",
+            run_id="test-run",
+            max_turns=1,
+            max_memory_operations_per_turn=3,
+        )
+
+        assert engine._max_memory_operations_per_turn == 3
+
+    @pytest.mark.parametrize("value", [True, "4", 4.0, -1])
+    def test_direct_engine_rejects_invalid_memory_budget(
+        self, tmp_path: Path, value: object
+    ) -> None:
+        with pytest.raises(ValueError, match="max_memory_operations_per_turn"):
+            RunEngine(
+                game=TinyGame(),
+                agent=FakeAgent(tool_name="act"),
+                run_dir=tmp_path / "run",
+                max_memory_operations_per_turn=value,  # type: ignore[arg-type]
+            )

@@ -29,6 +29,12 @@ class _StubPlugin:
     def player_ids(self) -> list[str]:
         return ["p1"]
 
+    def player_ids_from_config(self, game_config: dict) -> list[str]:
+        return self.player_ids
+
+    def validate_config(self, game_config: dict) -> None:
+        pass
+
     def system_prompt(self, actor_id: str) -> str:
         return "stub"
 
@@ -151,3 +157,131 @@ class TestGameRegistry:
 
         with pytest.raises(PluginError, match="name"):
             GameRegistry().discover()
+
+    def test_validate_plugin_config_calls_plugin_validate_config(self) -> None:
+        registry = GameRegistry()
+        plugin = _StubPlugin("test", "1.0")
+        registry.register(plugin)
+        # Should not raise
+        registry.validate_plugin_config("test", {})
+
+    def test_validate_plugin_config_rejects_unknown_plugin(self) -> None:
+        registry = GameRegistry()
+        with pytest.raises(PluginError, match="not found"):
+            registry.validate_plugin_config("nonexistent", {})
+
+    def test_validate_plugin_config_propagates_plugin_validation_error(self) -> None:
+        class _InvalidPlugin(_StubPlugin):
+            def validate_config(self, game_config):
+                raise ValueError("bad config")
+
+        registry = GameRegistry()
+        registry.register(_InvalidPlugin("bad", "1.0"))
+        with pytest.raises(ValueError, match="bad config"):
+            registry.validate_plugin_config("bad", {"key": "value"})
+
+    def test_validate_plugin_config_passes_game_config(self) -> None:
+        class _CheckingPlugin(_StubPlugin):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.received_config = None
+
+            def validate_config(self, game_config):
+                self.received_config = game_config
+
+        registry = GameRegistry()
+        plugin = _CheckingPlugin("checker", "1.0")
+        registry.register(plugin)
+        config = {"players": ["a", "b"]}
+        registry.validate_plugin_config("checker", config)
+        assert plugin.received_config == config
+
+    def test_legacy_plugin_uses_static_actor_ids_and_noop_validation(self) -> None:
+        plugin = SimpleNamespace(
+            name="legacy",
+            version="1.0",
+            player_ids=["p1"],
+            system_prompt=lambda actor_id: "stub",
+            create_session=lambda **kwargs: object(),
+        )
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        registry.validate_plugin_config("legacy", {})
+        assert registry.resolve_player_ids("legacy", {}) == ["p1"]
+
+    def test_configured_actor_plugin_does_not_require_static_actor_ids(self) -> None:
+        plugin = SimpleNamespace(
+            name="configured",
+            version="1.0",
+            player_ids_from_config=lambda config: ["a", "b"],
+            system_prompt=lambda actor_id: "stub",
+            create_session=lambda **kwargs: object(),
+        )
+
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        assert registry.resolve_player_ids("configured", {}) == ["a", "b"]
+
+    @pytest.mark.parametrize("actor_ids", [["a", "a"], [""], ["a", 1], "a"])
+    def test_resolve_player_ids_rejects_invalid_results(self, actor_ids) -> None:
+        plugin = SimpleNamespace(
+            name="invalid",
+            version="1.0",
+            player_ids_from_config=lambda config: actor_ids,
+            system_prompt=lambda actor_id: "stub",
+            create_session=lambda **kwargs: object(),
+        )
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        with pytest.raises(PluginError, match="actor IDs"):
+            registry.resolve_player_ids("invalid", {})
+
+
+class TestPokerPlugin:
+    def test_poker_entry_point_resolves(self, monkeypatch) -> None:
+        from benchtable.games.poker.session import PokerGame
+
+        plugins = [
+            SimpleNamespace(
+                name="poker",
+                load=lambda: PokerGame,
+            )
+        ]
+        monkeypatch.setattr("importlib.metadata.entry_points", lambda *, group: plugins)
+
+        registry = GameRegistry()
+        registry.discover()
+
+        poker = registry.load("poker")
+        assert poker.name == "poker"
+        assert poker.version
+
+    def test_poker_validate_config_valid(self) -> None:
+        from benchtable.games.poker.session import PokerGame
+
+        game = PokerGame()
+        game.validate_config(
+            {
+                "players": ["a", "b"],
+                "initial_stack": 1000,
+                "small_blind": 5,
+                "big_blind": 10,
+            }
+        )
+
+    def test_poker_validate_config_rejects_bad_players(self) -> None:
+        from benchtable.games.poker.session import PokerGame
+
+        game = PokerGame()
+        with pytest.raises(ValueError, match="unique"):
+            game.validate_config({"players": ["a", "a"]})
+
+    def test_poker_player_ids_from_config(self) -> None:
+        from benchtable.games.poker.session import PokerGame
+
+        game = PokerGame()
+        ids = game.player_ids_from_config({"players": ["x", "y", "z"]})
+        assert ids == ["x", "y", "z"]

@@ -131,6 +131,7 @@ class RunConfig(BaseModel):
     max_turns: StrictInt = Field(default=200, ge=1)
     max_invalid_attempts: StrictInt = Field(default=2, ge=0)
     max_provider_retries: StrictInt = Field(default=2, ge=0)
+    max_memory_operations_per_turn: StrictInt = Field(default=4, ge=0)
     game_config: JsonObject = Field(default_factory=dict)
 
     @field_validator("game_config")

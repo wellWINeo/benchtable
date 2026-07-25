@@ -111,9 +111,23 @@ def run_experiment(
         typer.echo(f"Plugin error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    if len(cfg.agents) > 1:
+    # Validate game-specific configuration before constructing agents.
+    try:
+        registry.validate_plugin_config(cfg.run.game, cfg.run.game_config)
+    except (ValueError, PluginError) as exc:
+        typer.echo(f"Game configuration error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        actor_ids = set(registry.resolve_player_ids(cfg.run.game, cfg.run.game_config))
+    except (PluginError, ValueError) as exc:
+        typer.echo(f"Game configuration error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    exact_mapping = registry.requires_exact_agent_ids(cfg.run.game)
+
+    if exact_mapping or len(cfg.agents) > 1:
         configured_ids = {agent_cfg.id for agent_cfg in cfg.agents}
-        actor_ids = set(game.player_ids)
         unknown_ids = sorted(configured_ids - actor_ids)
         missing_ids = sorted(actor_ids - configured_ids)
         if unknown_ids or missing_ids:
@@ -129,7 +143,6 @@ def run_experiment(
                 err=True,
             )
             raise typer.Exit(code=1)
-
     # Construct every configured agent so multi-actor games can dispatch by ID.
     agent_factory = _agent_factory or _default_agent_factory
     agents: dict[str, Agent] = {}
@@ -159,6 +172,7 @@ def run_experiment(
         max_turns=cfg.run.max_turns,
         max_invalid_attempts=cfg.run.max_invalid_attempts,
         max_provider_retries=cfg.run.max_provider_retries,
+        max_memory_operations_per_turn=cfg.run.max_memory_operations_per_turn,
     )
 
     try:

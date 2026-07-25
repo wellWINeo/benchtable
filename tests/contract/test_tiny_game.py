@@ -56,6 +56,8 @@ class TestTinyGameContract:
     def test_observations_are_actor_isolated(self, session: GameSession) -> None:
         obs_a = session.get_observation("a")
         obs_b = session.get_observation("b")
+        assert "secret_a" in obs_a.text.lower()
+        assert "secret_b" in obs_b.text.lower()
         assert "secret_b" not in obs_a.text.lower()
         assert "secret_a" not in obs_b.text.lower()
 
@@ -113,3 +115,29 @@ class TestTinyGameContract:
         assert isinstance(result, GameResult)
         assert result.completed
         assert "total_actions" in result.outcome
+
+    def test_player_ids_from_config_returns_static_list(self, game: TinyGame) -> None:
+        assert game.player_ids_from_config({}) == ["a", "b"]
+        assert game.player_ids_from_config({"anything": True}) == ["a", "b"]
+
+    def test_validate_config_accepts_empty_config(self, game: TinyGame) -> None:
+        assert game.validate_config({}) is None
+
+    def test_validate_config_accepts_known_fields(self, game: TinyGame) -> None:
+        assert game.validate_config({"max_actions": 10}) is None
+
+    def test_validate_config_rejects_bad_types(self, game: TinyGame) -> None:
+        with pytest.raises(ValueError):
+            game.validate_config({"max_actions": "not_an_int"})
+
+    def test_player_ids_from_config_returns_configured_list(
+        self, game: TinyGame
+    ) -> None:
+        result = game.player_ids_from_config({"players": ["x", "y"]})
+        assert result == ["x", "y"]
+
+    def test_player_ids_from_config_rejects_non_string_players(
+        self, game: TinyGame
+    ) -> None:
+        with pytest.raises(ValueError):
+            game.player_ids_from_config({"players": [1, 2]})

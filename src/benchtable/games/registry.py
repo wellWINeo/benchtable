@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Callable, cast
 
+from benchtable.contracts import JsonObject
 from benchtable.errors import PluginError
 from benchtable.games.protocol import GamePlugin
 
@@ -36,6 +37,47 @@ class GameRegistry:
             available = ", ".join(sorted(self._plugins.keys())) or "(none)"
             raise PluginError(f"Game plugin '{name}' not found. Available: {available}")
         return plugin
+
+    def validate_plugin_config(self, name: str, game_config: JsonObject) -> None:
+        """Validate game configuration through the plugin.
+
+        Raises PluginError if the plugin is not found, and re-raises any
+        ValueError raised by the plugin's ``validate_config`` method.
+        """
+        plugin = self.load(name)
+        validator = getattr(plugin, "validate_config", None)
+        if validator is not None:
+            if not callable(validator):
+                raise PluginError(
+                    f"Plugin '{name}' configuration validator must be callable"
+                )
+            cast(Callable[[JsonObject], None], validator)(game_config)
+
+    def resolve_player_ids(self, name: str, game_config: JsonObject) -> list[str]:
+        """Resolve actor IDs, supporting plugins from before config-aware actors."""
+        plugin = self.load(name)
+        resolver = getattr(plugin, "player_ids_from_config", None)
+        if resolver is None:
+            try:
+                player_ids = getattr(plugin, "player_ids")
+            except AttributeError as exc:
+                raise PluginError(
+                    f"Plugin '{name}' must define player_ids or player_ids_from_config"
+                ) from exc
+            return _validated_player_ids(player_ids, name)
+        if not callable(resolver):
+            raise PluginError(f"Plugin '{name}' actor resolver must be callable")
+        return _validated_player_ids(
+            cast(Callable[[JsonObject], list[str]], resolver)(game_config), name
+        )
+
+    def requires_exact_agent_ids(self, name: str) -> bool:
+        """Check if a plugin requires exact agent-to-player mapping."""
+        plugin = self.load(name)
+        try:
+            return bool(getattr(plugin, "requires_exact_agent_ids"))
+        except AttributeError:
+            return False
 
     def discover(self) -> None:
         """Discover plugins from the benchtable.games entry-point group."""
@@ -80,13 +122,15 @@ def _validated_plugin_name(plugin: GamePlugin) -> str:
         raise PluginError("Plugin metadata version must be a non-empty string")
 
     try:
-        player_ids = cast(object, plugin.player_ids)
+        player_ids = getattr(plugin, "player_ids", None)
     except Exception as exc:
         raise PluginError("Plugin player_ids could not be read") from exc
-    if not isinstance(player_ids, list) or not all(
-        isinstance(player_id, str) for player_id in cast(list[object], player_ids)
-    ):
-        raise PluginError("Plugin player_ids must be a list of strings")
+    if player_ids is None:
+        resolver = getattr(plugin, "player_ids_from_config", None)
+        if not callable(resolver):
+            raise PluginError("Plugin must define player_ids or player_ids_from_config")
+    else:
+        _validated_player_ids(player_ids, name)
 
     for attribute in ("system_prompt", "create_session"):
         try:
@@ -97,4 +141,32 @@ def _validated_plugin_name(plugin: GamePlugin) -> str:
             ) from exc
         if not callable(value):
             raise PluginError(f"Plugin attribute '{attribute}' must be callable")
+
+    # Validate optional configuration-aware methods if present
+    for attribute in ("player_ids_from_config", "validate_config"):
+        try:
+            value = getattr(plugin, attribute)
+        except Exception:
+            continue
+        if not callable(value):
+            raise PluginError(f"Plugin attribute '{attribute}' must be callable")
+
     return name
+
+
+def _validated_player_ids(value: object, plugin_name: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(
+            type(player_id) is str and bool(player_id.strip())
+            for player_id in cast(list[object], value)
+        )
+    ):
+        raise PluginError(
+            f"Plugin '{plugin_name}' actor IDs must be a list of non-empty strings"
+        )
+    player_ids = cast(list[str], value)
+    if len(set(player_ids)) != len(player_ids):
+        raise PluginError(f"Plugin '{plugin_name}' actor IDs must be unique")
+    return player_ids

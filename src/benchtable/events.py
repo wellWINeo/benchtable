@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -22,6 +23,7 @@ _CREDENTIAL_KEYS = frozenset(
         "passwd",
         "clientsecret",
         "secret",
+        "secretkey",
         "token",
         "bearertoken",
         "auth",
@@ -38,9 +40,23 @@ _CREDENTIAL_PATTERNS = [
     "Bearer ",  # Bearer tokens
 ]
 
+_CREDENTIAL_KEY_VALUE_PATTERN = re.compile(
+    r"(?P<key>\b(?:api[\W_]*key|api[\W_]*token|authorization|password|"
+    r"passwd|access[\W_]*token|client[\W_]*secret|secret[\W_]*key|"
+    r"secret|token|auth|credential)\b)"
+    r"(?P<separator>\s*[:=]\s*)"
+    r"(?:"
+    r'(?P<double>"(?:\\.|[^"\\])*")'
+    r"|(?P<single>'(?:\\.|[^'\\])*')"
+    r"|(?P<opening>[\[({])(?P<delimited>.*?)(?P<closing>[\])}])"
+    r"|(?P<bare>(?:Bearer\s+)?[^\s,;'\"})\]]+)"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def _normalize_key(value: str) -> str:
-    return value.casefold().replace("-", "").replace("_", "")
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
 def _redact(value: Any) -> Any:
@@ -64,6 +80,10 @@ def _redact(value: Any) -> Any:
 
 def _redact_string(s: str) -> str:
     """Redact credential-shaped substrings in a string."""
+    s = _CREDENTIAL_KEY_VALUE_PATTERN.sub(
+        lambda match: _redact_key_value_match(match),
+        s,
+    )
     for prefix in _CREDENTIAL_PATTERNS:
         prefix_lower = prefix.lower()
         search_from = 0
@@ -74,7 +94,7 @@ def _redact_string(s: str) -> str:
 
             # Redact from the prefix to the next whitespace/end.
             end = idx + len(prefix)
-            while end < len(s) and s[end] not in " \t\n,.;'\"})]":
+            while end < len(s) and s[end] not in " \t\n,;'\"})]":
                 end += 1
             if end > idx + len(prefix):
                 s = s[: idx + len(prefix)] + "[REDACTED]" + s[end:]
@@ -82,6 +102,19 @@ def _redact_string(s: str) -> str:
             else:
                 search_from = end
     return s
+
+
+def _redact_key_value_match(match: re.Match[str]) -> str:
+    """Replace a matched credential value while retaining its delimiters."""
+    prefix = match.group("key") + match.group("separator")
+    if match.group("double") is not None:
+        return f'{prefix}"[REDACTED]"'
+    if match.group("single") is not None:
+        return f"{prefix}'[REDACTED]'"
+    opening = match.group("opening")
+    if opening is not None:
+        return f"{prefix}[REDACTED]"
+    return f"{prefix}[REDACTED]"
 
 
 def _normalize(value: Any) -> Any:

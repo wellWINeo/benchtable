@@ -452,6 +452,145 @@ class TestRunCommand:
         assert "missing" in result.output.lower()
         assert constructed == []
 
+    def test_multi_agent_configuration_uses_configured_actor_ids(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        created_agents: dict[str, FakeAgent] = {}
+
+        def fake_agent_factory(agent_config: Any) -> FakeAgent:
+            agent = FakeAgent(tool_name="act")
+            created_agents[agent_config.id] = agent
+            return agent
+
+        cli.set_agent_factory(fake_agent_factory)
+        registry = GameRegistry()
+        registry.register(TinyGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [run.game_config]
+            players = ["north", "south"]
+            max_actions = 2
+
+            [[agents]]
+            id = "north"
+            model = "fake-north"
+
+            [[agents]]
+            id = "south"
+            model = "fake-south"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 0
+        assert {request.actor_id for request in created_agents["north"].requests} == {
+            "north"
+        }
+        assert {request.actor_id for request in created_agents["south"].requests} == {
+            "south"
+        }
+
+    def test_actor_resolution_errors_are_reported_before_agent_construction(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class _BrokenActorConfigGame(TinyGame):
+            def player_ids_from_config(self, game_config):
+                raise ValueError("players are malformed")
+
+        constructed: list[str] = []
+
+        def fake_agent_factory(agent_config: Any) -> FakeAgent:
+            constructed.append(agent_config.id)
+            return FakeAgent(tool_name="act")
+
+        cli.set_agent_factory(fake_agent_factory)
+        registry = GameRegistry()
+        registry.register(_BrokenActorConfigGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+
+            [[agents]]
+            id = "b"
+            model = "fake-b"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code != 0
+        assert "game configuration error" in result.output.lower()
+        assert "players are malformed" in result.output
+        assert constructed == []
+
+    def test_single_agent_still_validates_actor_configuration_before_construction(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class _BrokenActorConfigGame(TinyGame):
+            def player_ids_from_config(self, game_config):
+                raise ValueError("players are malformed")
+
+        constructed: list[str] = []
+        cli.set_agent_factory(
+            lambda agent_config: (
+                constructed.append(agent_config.id) or FakeAgent(tool_name="act")
+            )
+        )
+        registry = GameRegistry()
+        registry.register(_BrokenActorConfigGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code != 0
+        assert "game configuration error" in result.output.lower()
+        assert constructed == []
+
     def test_run_discovery_errors_are_rendered_before_agent_construction(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -491,6 +630,94 @@ class TestRunCommand:
         assert "Plugin discovery error" in result.output
         assert "broken entry point" in result.output
         assert constructed == []
+
+    def test_run_validates_game_config_before_agent_construction(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class _ConfigValidatingGame(TinyGame):
+            def validate_config(self, game_config):
+                if game_config.get("fail_validation"):
+                    raise ValueError("intentional validation failure")
+
+        constructed: list[str] = []
+
+        def fake_agent_factory(agent_config: Any) -> FakeAgent:
+            constructed.append(agent_config.id)
+            return FakeAgent(tool_name="act")
+
+        cli.set_agent_factory(fake_agent_factory)
+        registry = GameRegistry()
+        registry.register(_ConfigValidatingGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [run.game_config]
+            fail_validation = true
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code != 0
+        assert (
+            "validation failure" in result.output.lower()
+            or "error" in result.output.lower()
+        )
+        assert constructed == []
+
+    def test_run_passes_game_config_to_validate(self, tmp_path: Path) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        received_configs: list[dict] = []
+
+        class _RecordingGame(TinyGame):
+            def validate_config(self, game_config):
+                received_configs.append(game_config)
+
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        registry = GameRegistry()
+        registry.register(_RecordingGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [run.game_config]
+            key = "value"
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+        """)
+        )
+
+        output_dir = tmp_path / "out"
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(output_dir)],
+        )
+
+        assert result.exit_code == 0
+        assert received_configs == [{"key": "value"}]
 
     def test_run_with_tiny_game_writes_trace(self, tmp_path: Path) -> None:
         from benchtable.games.registry import GameRegistry
@@ -540,3 +767,192 @@ class TestRunCommand:
             app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
         )
         assert result.exit_code != 0
+
+    def test_run_forwards_max_memory_operations_per_turn_to_engine(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from benchtable import engine
+        from benchtable.games.registry import GameRegistry
+
+        captured_kwargs: dict[str, Any] = {}
+
+        class _CaptureEngine:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.update(kwargs)
+
+            async def run(self) -> Any:
+                return type("Result", (), {"success": True})()
+
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        monkeypatch.setattr(engine, "RunEngine", _CaptureEngine)
+
+        registry = GameRegistry()
+        registry.register(TinyGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_memory_operations_per_turn = 10
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 0
+        assert captured_kwargs["max_memory_operations_per_turn"] == 10
+
+    def test_run_records_max_memory_operations_per_turn_in_trace(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        registry = GameRegistry()
+        registry.register(TinyGame(max_actions=1))
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_memory_operations_per_turn = 10
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+        """)
+        )
+        output_dir = tmp_path / "out"
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(output_dir)],
+        )
+
+        assert result.exit_code == 0
+        events = [
+            json.loads(line)
+            for line in (output_dir / "events.jsonl").read_text().splitlines()
+            if line
+        ]
+        assert events[0]["payload"]["max_memory_operations_per_turn"] == 10
+
+    def test_poker_config_validates_before_agent_construction(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.poker.session import PokerGame
+        from benchtable.games.registry import GameRegistry
+
+        constructed: list[str] = []
+
+        def fake_agent_factory(agent_config: Any) -> FakeAgent:
+            constructed.append(agent_config.id)
+            return FakeAgent(tool_name="act")
+
+        cli.set_agent_factory(fake_agent_factory)
+        registry = GameRegistry()
+        registry.register(PokerGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "poker"
+            matches = 1
+            seed = 42
+            max_turns = 10
+
+            [run.game_config]
+            players = ["a", "b"]
+            hands_per_match = 1
+            initial_stack = 1000
+            small_blind = 5
+            big_blind = 10
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+
+            [[agents]]
+            id = "b"
+            model = "fake-b"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 0
+        assert set(constructed) == {"a", "b"}
+
+    def test_poker_list_games_includes_poker(self) -> None:
+        from benchtable.games.poker.session import PokerGame
+        from benchtable.games.registry import GameRegistry
+
+        registry = GameRegistry()
+        registry.register(PokerGame())
+        cli.set_registry(registry)
+
+        result = runner.invoke(app, ["list-games"])
+        assert result.exit_code == 0
+        assert "poker" in result.output.lower()
+
+    def test_poker_rejects_missing_player_ids(self, tmp_path: Path) -> None:
+        from benchtable.games.poker.session import PokerGame
+        from benchtable.games.registry import GameRegistry
+
+        constructed: list[str] = []
+
+        def fake_agent_factory(agent_config: Any) -> FakeAgent:
+            constructed.append(agent_config.id)
+            return FakeAgent(tool_name="act")
+
+        cli.set_agent_factory(fake_agent_factory)
+        registry = GameRegistry()
+        registry.register(PokerGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "poker"
+            matches = 1
+
+            [run.game_config]
+            players = ["a", "b"]
+
+            [[agents]]
+            id = "a"
+            model = "fake-a"
+
+            [[agents]]
+            id = "c"
+            model = "fake-c"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code != 0
+        assert "missing" in result.output.lower() or "unknown" in result.output.lower()
+        assert constructed == []

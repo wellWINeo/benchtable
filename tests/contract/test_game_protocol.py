@@ -138,3 +138,23 @@ class TestGameProtocol:
         transition = session.apply_action(actor, tools[0].name, {})
         assert isinstance(transition.summary, str)
         assert len(transition.summary) > 0
+
+    def test_player_ids_from_config_returns_static_when_not_overridden(self) -> None:
+        from tests.fixtures.tiny_game import TinyGame
+
+        game = TinyGame()
+        assert game.player_ids_from_config({}) == ["a", "b"]
+
+    def test_validate_config_returns_none_for_valid_config(self) -> None:
+        from tests.fixtures.tiny_game import TinyGame
+
+        game = TinyGame()
+        assert game.validate_config({}) is None
+        assert game.validate_config({"max_actions": 5}) is None
+
+    def test_validate_config_raises_for_invalid_config(self) -> None:
+        from tests.fixtures.tiny_game import TinyGame
+
+        game = TinyGame()
+        with pytest.raises(ValueError):
+            game.validate_config({"max_actions": "not_an_int"})

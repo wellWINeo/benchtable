@@ -42,11 +42,28 @@ class GamePlugin(Protocol):
     @property
     def version(self) -> str: ...
 
-    @property
-    def player_ids(self) -> list[str]: ...
-
     def system_prompt(self, actor_id: str) -> str: ...
 
     def create_session(
         self, *, seed: int, game_config: JsonObject | None = None
     ) -> GameSession: ...
+
+
+class StaticActorGamePlugin(GamePlugin, Protocol):
+    """Optional compatibility contract for plugins with fixed actor IDs."""
+
+    @property
+    def player_ids(self) -> list[str]: ...
+
+
+class ConfiguredActorGamePlugin(GamePlugin, Protocol):
+    """Optional contract for plugins whose actors come from configuration."""
+
+    def player_ids_from_config(self, game_config: JsonObject) -> list[str]: ...
+
+
+class ExactAgentMappingGamePlugin(GamePlugin, Protocol):
+    """Optional contract for plugins requiring one agent per player."""
+
+    @property
+    def requires_exact_agent_ids(self) -> bool: ...

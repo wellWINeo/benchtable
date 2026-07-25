@@ -28,6 +28,7 @@ class _TinySession:
         failed_turn_recovery: bool = False,
         recovery_terminates: bool = False,
         failed_turn_calls: list[str] | None = None,
+        actors: list[str] | None = None,
     ) -> None:
         self._seed = seed
         self._actions_taken = 0
@@ -36,18 +37,19 @@ class _TinySession:
         self._failed_turn_recovery = failed_turn_recovery
         self._recovery_terminates = recovery_terminates
         self._failed_turn_calls = failed_turn_calls
-        self._actors = ("a", "b")
-        self._private = {"a": "secret_a", "b": "secret_b"}
+        self._actors = tuple(actors or ("a", "b"))
+        self._private = {actor: f"secret_{actor}" for actor in self._actors}
 
     @property
     def current_actor_id(self) -> str:
-        return self._actors[self._actions_taken % 2]
+        return self._actors[self._actions_taken % len(self._actors)]
 
     def get_observation(self, actor_id: str) -> Observation:
         return Observation(
             actor_id=actor_id,
             text=(
                 f"You are player {actor_id}. "
+                f"Your private marker is {self._private[actor_id]}. "
                 f"Actions taken so far: {self._actions_taken}. "
                 f"It is your turn."
             ),
@@ -137,6 +139,26 @@ class TinyGame:
     def player_ids(self) -> list[str]:
         return ["a", "b"]
 
+    def player_ids_from_config(self, game_config: JsonObject) -> list[str]:
+        configured_players = game_config.get("players")
+        if configured_players is not None:
+            if not isinstance(configured_players, list) or not all(
+                isinstance(p, str) for p in configured_players
+            ):
+                raise ValueError("'players' must be a list of strings")
+            if len(configured_players) < 1:
+                raise ValueError("At least one player is required")
+            if len(set(configured_players)) != len(configured_players):
+                raise ValueError("'players' must not contain duplicates")
+            return configured_players
+        return self.player_ids
+
+    def validate_config(self, game_config: JsonObject) -> None:
+        configured_max_actions = game_config.get("max_actions")
+        if configured_max_actions is not None:
+            if not isinstance(configured_max_actions, int):
+                raise ValueError("'max_actions' must be an integer")
+
     def system_prompt(self, actor_id: str) -> str:
         return (
             f"You are player {actor_id} in a simple alternating-choice game. "
@@ -148,6 +170,7 @@ class TinyGame:
     ) -> _TinySession:
         config = game_config or {}
         self.created_game_configs.append(config)
+        actors = self.player_ids_from_config(config)
         configured_max_actions = config.get("max_actions")
         max_actions = (
             configured_max_actions
@@ -161,4 +184,5 @@ class TinyGame:
             failed_turn_recovery=self._failed_turn_recovery,
             recovery_terminates=self._recovery_terminates,
             failed_turn_calls=self.failed_turn_calls,
+            actors=actors,
         )
