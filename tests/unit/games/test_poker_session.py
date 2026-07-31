@@ -95,6 +95,65 @@ class TestPokerSession:
         assert session._hand is not None
         assert session._hand.street == Street.FLOP
 
+    def test_heads_up_postflop_starts_with_dealer(self) -> None:
+        session = PokerSession(
+            players=["a", "b"],
+            initial_stack=1000,
+            small_blind=5,
+            big_blind=10,
+            hands_per_match=1,
+            seed=42,
+        )
+        assert session._hand is not None
+        dealer = session._hand.dealer_id
+        assert session.current_actor_id == dealer
+
+        session.apply_action(dealer, "poker_action", {"action": "call"})
+        session.apply_action(
+            session.current_actor_id, "poker_action", {"action": "check"}
+        )
+
+        assert session._hand.street == Street.FLOP
+        assert session.current_actor_id == dealer
+
+    def test_does_not_advertise_raise_without_a_legal_target(self) -> None:
+        session = PokerSession(
+            players=["a", "b"],
+            initial_stack=20,
+            small_blind=5,
+            big_blind=10,
+            hands_per_match=1,
+            seed=42,
+        )
+        dealer = session.current_actor_id
+        session.apply_action(dealer, "poker_action", {"action": "call"})
+        session.apply_action(
+            session.current_actor_id, "poker_action", {"action": "all_in"}
+        )
+
+        assert session.current_actor_id == dealer
+        assert "raise" not in session._legal_actions(dealer)
+
+    def test_does_not_advertise_bet_without_a_legal_target(self) -> None:
+        session = PokerSession(
+            players=["a", "b"],
+            initial_stack=20,
+            small_blind=5,
+            big_blind=10,
+            hands_per_match=1,
+            seed=42,
+        )
+        session.apply_action(
+            session.current_actor_id, "poker_action", {"action": "call"}
+        )
+        session.apply_action(
+            session.current_actor_id, "poker_action", {"action": "check"}
+        )
+
+        assert session._hand is not None
+        assert session._hand.street == Street.FLOP
+        assert "bet" not in session._legal_actions(session.current_actor_id)
+
     def test_normal_check_call_progresses_through_all_postflop_streets(self) -> None:
         session = PokerSession(
             players=["a", "b"],

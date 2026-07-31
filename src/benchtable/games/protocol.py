@@ -7,7 +7,9 @@ from typing import Protocol, runtime_checkable
 from benchtable.contracts import (
     GameResult,
     JsonObject,
+    MatchMemorySummary,
     Observation,
+    PluginEvent,
     ToolSpec,
     Transition,
 )
@@ -30,6 +32,28 @@ class GameSession(Protocol):
     def is_terminal(self) -> bool: ...
 
     def get_result(self) -> GameResult: ...
+
+
+@runtime_checkable
+class ConversationScopedSession(Protocol):
+    """Optional capability exposing the current conversation scope."""
+
+    @property
+    def conversation_scope_id(self) -> str: ...
+
+
+@runtime_checkable
+class MatchMemorySummarySession(Protocol):
+    """Optional capability exposing drained public memory summaries."""
+
+    def drain_match_memory_summaries(self) -> list[MatchMemorySummary]: ...
+
+
+@runtime_checkable
+class PluginEventSession(Protocol):
+    """Optional capability exposing typed plugin lifecycle events."""
+
+    def drain_hand_events(self) -> list[PluginEvent]: ...
 
 
 @runtime_checkable

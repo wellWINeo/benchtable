@@ -76,6 +76,64 @@ class TestListGames:
         assert "Plugin discovery error" in result.output
         assert "broken entry point" in result.output
 
+    def test_unexpected_discovery_errors_are_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        def fail_discovery(registry: GameRegistry) -> None:
+            raise RuntimeError("api_key: discovery-secret")
+
+        monkeypatch.setattr(GameRegistry, "discover", fail_discovery)
+        cli.set_registry(None)
+
+        result = runner.invoke(app, ["list-games"])
+
+        assert result.exit_code != 0
+        assert "Plugin discovery error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "discovery-secret" not in result.output
+
+    def test_unexpected_configuration_errors_are_redacted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def fail_load_config(path: Path) -> Any:
+            raise RuntimeError("api_key: config-load-secret")
+
+        monkeypatch.setattr(cli, "load_config", fail_load_config)
+
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--config",
+                str(tmp_path / "config.toml"),
+                "--output",
+                str(tmp_path / "out"),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "Configuration error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "config-load-secret" not in result.output
+
+    def test_listing_exceptions_are_redacted(self) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class BrokenListRegistry(GameRegistry):
+            def list(self) -> list[Any]:
+                raise RuntimeError("api_key: list-secret")
+
+        cli.set_registry(BrokenListRegistry())
+
+        result = runner.invoke(app, ["list-games"])
+
+        assert result.exit_code != 0
+        assert "Plugin listing error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "list-secret" not in result.output
+
     def test_malformed_plugin_metadata_is_not_an_attribute_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -101,6 +159,235 @@ class TestListGames:
 
 
 class TestRunCommand:
+    def test_single_agent_passes_id_for_exact_mapping_game(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class SingleActorExactMappingGame(TinyGame):
+            @property
+            def requires_exact_agent_ids(self) -> bool:
+                return True
+
+        created_agents: dict[str, FakeAgent] = {}
+
+        def fake_agent_factory(agent_config: Any) -> FakeAgent:
+            agent = FakeAgent(tool_name="act")
+            created_agents[agent_config.id] = agent
+            return agent
+
+        cli.set_agent_factory(fake_agent_factory)
+        registry = GameRegistry()
+        registry.register(SingleActorExactMappingGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [run.game_config]
+            players = ["a"]
+            max_actions = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake"
+        """)
+        )
+
+        result = runner.invoke(
+            app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code == 0
+        assert set(created_agents) == {"a"}
+        assert {request.actor_id for request in created_agents["a"].requests} == {"a"}
+
+    def test_exact_mapping_capability_errors_are_rendered_as_cli_errors(
+        self, tmp_path: Path
+    ) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class BrokenCapabilityGame(TinyGame):
+            @property
+            def requires_exact_agent_ids(self) -> bool:
+                raise RuntimeError("Authorization: top-secret")
+
+        registry = GameRegistry()
+        registry.register(BrokenCapabilityGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [run.game_config]
+            players = ["a", "b"]
+            max_actions = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake"
+
+            [[agents]]
+            id = "b"
+            model = "fake"
+        """)
+        )
+
+        result = runner.invoke(
+            app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code != 0
+        assert "Plugin error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "top-secret" not in result.output
+
+    def test_plugin_validation_exceptions_are_redacted(self, tmp_path: Path) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class BrokenValidationGame(TinyGame):
+            def validate_config(self, game_config: dict[str, Any]) -> None:
+                raise RuntimeError("Authorization: config-secret")
+
+        registry = GameRegistry()
+        registry.register(BrokenValidationGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake"
+        """)
+        )
+
+        result = runner.invoke(
+            app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code != 0
+        assert "Game configuration error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "config-secret" not in result.output
+
+    def test_agent_factory_exceptions_are_redacted(self, tmp_path: Path) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        def broken_agent_factory(agent_config: Any) -> FakeAgent:
+            raise RuntimeError("api_key: agent-secret")
+
+        cli.set_agent_factory(broken_agent_factory)
+        registry = GameRegistry()
+        registry.register(TinyGame())
+        cli.set_registry(registry)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake"
+        """)
+        )
+
+        result = runner.invoke(
+            app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code != 0
+        assert "Agent error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "agent-secret" not in result.output
+
+    def test_unexpected_run_exceptions_are_redacted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from benchtable import engine
+        from benchtable.games.registry import GameRegistry
+
+        class BrokenEngine:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+
+            async def run(self) -> Any:
+                raise RuntimeError("api_key: run-secret")
+
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        registry = GameRegistry()
+        registry.register(TinyGame())
+        cli.set_registry(registry)
+        monkeypatch.setattr(engine, "RunEngine", BrokenEngine)
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake"
+        """)
+        )
+
+        result = runner.invoke(
+            app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code != 0
+        assert "Run error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "run-secret" not in result.output
+
+    def test_unexpected_plugin_load_errors_are_redacted(self, tmp_path: Path) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        class BrokenLoadRegistry(GameRegistry):
+            def load(self, name: str) -> Any:
+                raise RuntimeError("api_key: load-secret")
+
+        cli.set_registry(BrokenLoadRegistry())
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake"
+        """)
+        )
+
+        result = runner.invoke(
+            app, ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code != 0
+        assert "Plugin error" in result.output
+        assert "[REDACTED]" in result.output
+        assert "load-secret" not in result.output
+
     def test_run_forwards_completion_token_limit_to_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

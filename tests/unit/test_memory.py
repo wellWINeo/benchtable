@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from benchtable.contracts import ToolSpec
+from benchtable.contracts import MatchMemorySummary, ToolSpec
 from benchtable.memory import MatchMemory
 
 
@@ -23,6 +23,31 @@ class TestMatchMemory:
         store.write("a", text="third", hand=2, turn=0)
         notes = store.read("a")
         assert [n["text"] for n in notes] == ["first", "second", "third"]
+
+    def test_read_merges_agent_notes_and_system_summaries_in_order(self) -> None:
+        store = MatchMemory()
+        store.write("a", text="agent-1", hand=1, turn=0)
+        store.append_summary(
+            MatchMemorySummary(actor_id="a", text="system-1", hand=1, turn=1)
+        )
+        store.write("a", text="agent-2", hand=1, turn=2)
+
+        notes = store.read("a")
+
+        assert [n["source"] for n in notes] == ["agent", "system", "agent"]
+        assert [n["text"] for n in notes] == ["agent-1", "system-1", "agent-2"]
+
+    def test_system_summary_does_not_consume_agent_limits(self) -> None:
+        store = MatchMemory(max_entries=1)
+        store.write("a", text="agent", hand=1, turn=0)
+        store.append_summary(
+            MatchMemorySummary(actor_id="a", text="system", hand=1, turn=1)
+        )
+
+        with pytest.raises(ValueError, match="Entry limit"):
+            store.write("a", text="overflow", hand=1, turn=2)
+
+        assert [note["text"] for note in store.read("a")] == ["agent", "system"]
 
     def test_read_includes_hand_and_turn_context(self) -> None:
         store = MatchMemory()
@@ -74,6 +99,8 @@ class TestMatchMemory:
         spec = MatchMemory.read_tool_spec()
         assert isinstance(spec, ToolSpec)
         assert spec.name == "read_memory"
+        assert "private notes" in spec.description
+        assert "system summaries" in spec.description
         assert spec.parameters["type"] == "object"
         assert spec.parameters.get("properties") == {}
         assert spec.parameters["additionalProperties"] is False
@@ -89,6 +116,13 @@ class TestMatchMemory:
     def test_read_returns_empty_list_for_unknown_actor(self) -> None:
         store = MatchMemory()
         assert store.read("nonexistent") == []
+
+    def test_system_summaries_are_actor_private(self) -> None:
+        store = MatchMemory()
+        store.append_summary(
+            MatchMemorySummary(actor_id="a", text="summary-a", hand=1, turn=0)
+        )
+        assert store.read("b") == []
 
     def test_notes_are_copy_safe(self) -> None:
         store = MatchMemory()
@@ -112,22 +146,3 @@ class TestMatchMemory:
     ) -> None:
         with pytest.raises(ValueError, match="non-negative integer"):
             MatchMemory(**{field: value})
-
-    def test_prepared_batch_commit_does_not_revalidate_or_partially_commit(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        store = MatchMemory()
-        store.write("a", text="existing", hand=1, turn=0)
-        prepared = store.prepare_write_batch("a", [("first", 1, 1), ("second", 1, 2)])
-
-        def fail_if_revalidated(*_: object, **__: object) -> None:
-            raise AssertionError("prepared batch was revalidated")
-
-        monkeypatch.setattr(store, "validate_write_batch", fail_if_revalidated)
-        store.commit_batch(prepared)
-
-        assert [note["text"] for note in store.read("a")] == [
-            "existing",
-            "first",
-            "second",
-        ]

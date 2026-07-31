@@ -129,14 +129,37 @@ class OpenAICompatibleAgent:
         try:
             return self._normalize_response(response)
         except Exception as exc:
-            raise self._provider_error(exc) from exc
+            raise self._provider_error(
+                exc,
+                raw_provider_response=self._raw_provider_response(response),
+            ) from exc
 
-    def _provider_error(self, exc: Exception) -> ProviderError:
+    def _provider_error(
+        self,
+        exc: Exception,
+        *,
+        raw_provider_response: Any | None = None,
+    ) -> ProviderError:
         message = str(exc)
         api_key = os.environ.get(self._api_key_env)
         if api_key:
             message = message.replace(api_key, "[REDACTED]")
-        return ProviderError(message, provider="openai", model=self._model)
+        return ProviderError(
+            message,
+            provider="openai",
+            model=self._model,
+            raw_provider_response=raw_provider_response,
+        )
+
+    @staticmethod
+    def _raw_provider_response(response: Any) -> Any | None:
+        model_dump = getattr(response, "model_dump", None)
+        if not callable(model_dump):
+            return None
+        try:
+            return model_dump(mode="json")
+        except Exception:
+            return None
 
     def _normalize_response(self, response: Any) -> ModelResponse:
         choice = response.choices[0]

@@ -81,6 +81,15 @@ class TestGameRegistry:
         with pytest.raises(PluginError, match="system_prompt"):
             GameRegistry().register(plugin)
 
+    def test_register_rejects_broken_optional_capability(self) -> None:
+        class _BrokenOptionalPlugin(_StubPlugin):
+            @property
+            def player_ids_from_config(self):
+                raise RuntimeError("capability unavailable")
+
+        with pytest.raises(PluginError, match="optional attribute"):
+            GameRegistry().register(_BrokenOptionalPlugin())
+
     def test_load_returns_cached_plugin(self) -> None:
         registry = GameRegistry()
         plugin = _StubPlugin("alpha")

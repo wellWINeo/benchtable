@@ -63,12 +63,12 @@ def build_pots(contributions: dict[str, PotContribution]) -> list[Pot]:
     ):
         raise ValueError("Contributions have no eligible players")
     if len(active) >= 2:
-        highest = max(effective[player] for player in active)
-        leaders = [player for player in active if effective[player] == highest]
-        if len(leaders) == 1:
+        highest = max(effective.values())
+        leaders = [player for player, amount in effective.items() if amount == highest]
+        if len(leaders) == 1 and leaders[0] in active:
             leader = leaders[0]
             second = max(
-                (effective[player] for player in active if player != leader),
+                (amount for player, amount in effective.items() if player != leader),
                 default=0,
             )
             excess = highest - second

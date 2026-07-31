@@ -50,6 +50,9 @@ class FakeAgent:
         if self._raise is not None:
             raise self._raise
 
+        if not request.tools:
+            return ModelResponse(assistant_text="", tool_calls=[], finish_reason="stop")
+
         if self._responses:
             return self._responses.pop(0)
 

@@ -1,5 +1,12 @@
 # Poker Game Fix Implementation Plan
 
+> **Historical / superseded by the 2026-07-26 hand-session design. Do not execute
+> this historical plan.** It is retained as historical task context only. Current
+> semantics are that memory calls occur in separate model responses before the
+> game-action response, mixed memory/action responses are rejected, and memory
+> writes are memory-only and committed immediately. The paired, batched, and
+> accompanying-write instructions below are obsolete.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Repair the reviewed poker plugin, generic memory loop, failure semantics, trace redaction, tests, and verification failures without changing the approved architecture.

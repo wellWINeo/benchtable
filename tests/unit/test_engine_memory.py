@@ -11,6 +11,7 @@ from tests.fixtures.tiny_game import TinyGame
 
 from benchtable.contracts import (
     GameResult,
+    MatchMemorySummary,
     ModelResponse,
     Observation,
     ToolCall,
@@ -26,8 +27,159 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in raw.splitlines() if line]
 
 
+class _InitialSummarySession:
+    def __init__(self, *, terminal: bool = False) -> None:
+        self.actions = 1 if terminal else 0
+        self.pending = [
+            MatchMemorySummary(
+                actor_id="a",
+                text="pre-existing public summary",
+                hand=0,
+                turn=0,
+            )
+        ]
+
+    @property
+    def current_actor_id(self) -> str:
+        return "a"
+
+    def get_observation(self, actor_id: str) -> Observation:
+        return Observation(actor_id=actor_id, text="Choose an action.")
+
+    def get_tools(self, actor_id: str) -> list[ToolSpec]:
+        return [
+            ToolSpec(
+                name="act",
+                description="Act",
+                parameters={"type": "object", "properties": {}},
+            )
+        ]
+
+    def apply_action(
+        self, actor_id: str, tool_name: str, arguments: dict[str, object]
+    ) -> Transition:
+        self.actions = 1
+        return Transition(summary="acted")
+
+    def drain_match_memory_summaries(self) -> list[MatchMemorySummary]:
+        summaries = list(self.pending)
+        self.pending.clear()
+        return summaries
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.actions >= 1
+
+    def get_result(self) -> GameResult:
+        return GameResult(completed=True, outcome={})
+
+
+class _InitialSummaryGame:
+    def __init__(self, *, terminal: bool = False) -> None:
+        self.terminal = terminal
+
+    @property
+    def name(self) -> str:
+        return "initial-summary"
+
+    @property
+    def version(self) -> str:
+        return "1"
+
+    def system_prompt(self, actor_id: str) -> str:
+        return "Act."
+
+    def create_session(
+        self, *, seed: int, game_config: dict[str, object] | None = None
+    ) -> _InitialSummarySession:
+        return _InitialSummarySession(terminal=self.terminal)
+
+
 class TestMemoryInteraction:
-    async def test_direct_paired_write_uses_session_turn_context(
+    async def test_initial_summary_is_readable_on_first_turn(
+        self, tmp_path: Path
+    ) -> None:
+        agent = FakeAgent(
+            responses=[
+                ModelResponse(
+                    assistant_text="Read memory.",
+                    tool_calls=[
+                        ToolCall(call_id="read", name="read_memory", arguments={})
+                    ],
+                    finish_reason="stop",
+                ),
+                ModelResponse(
+                    assistant_text="Act.",
+                    tool_calls=[ToolCall(call_id="act", name="act", arguments={})],
+                    finish_reason="stop",
+                ),
+                ModelResponse(
+                    assistant_text="Finished.",
+                    tool_calls=[],
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        engine = RunEngine(
+            game=_InitialSummaryGame(),
+            agents={"a": agent},
+            run_dir=tmp_path / "run",
+            run_id="initial-summary-read-test",
+            max_turns=1,
+        )
+
+        result = await engine.run()
+
+        assert result.success
+        memory_result = next(
+            message
+            for message in agent.requests[1].messages
+            if message.get("role") == "tool" and message.get("tool_call_id") == "read"
+        )
+        entries = json.loads(str(memory_result["content"]))
+        assert entries[0]["text"] == "pre-existing public summary"
+        events = _read_events(tmp_path / "run")
+        summary_event = next(
+            event
+            for event in events
+            if event["event_type"] == "memory_operation"
+            and event["payload"]["operation"] == "summary"
+        )
+        assert summary_event["actor_id"] == "a"
+        assert summary_event.get("turn_index") is None
+
+    async def test_initial_terminal_summary_is_stored_before_match_end(
+        self, tmp_path: Path
+    ) -> None:
+        engine = RunEngine(
+            game=_InitialSummaryGame(terminal=True),
+            agents={"a": FakeAgent(tool_name="act")},
+            run_dir=tmp_path / "run",
+            run_id="initial-terminal-summary-test",
+            max_turns=1,
+        )
+
+        result = await engine.run()
+
+        assert result.success
+        events = _read_events(tmp_path / "run")
+        summary_index = next(
+            index
+            for index, event in enumerate(events)
+            if event["event_type"] == "memory_operation"
+            and event["payload"]["operation"] == "summary"
+        )
+        match_end_index = next(
+            index
+            for index, event in enumerate(events)
+            if event["event_type"] == "match_end"
+        )
+        assert summary_index < match_end_index
+        summary_event = events[summary_index]
+        assert summary_event["actor_id"] == "a"
+        assert summary_event["payload"]["text"] == "pre-existing public summary"
+
+    async def test_memory_only_write_uses_session_turn_context(
         self, tmp_path: Path
     ) -> None:
         class ContextSession:
@@ -85,15 +237,19 @@ class TestMemoryInteraction:
 
         responses = [
             ModelResponse(
-                assistant_text="Act and remember.",
+                assistant_text="Remember directly.",
                 tool_calls=[
-                    ToolCall(call_id="act-1", name="act", arguments={}),
                     ToolCall(
                         call_id="write-1",
                         name="write_memory",
                         arguments={"text": "direct"},
                     ),
                 ],
+                finish_reason="stop",
+            ),
+            ModelResponse(
+                assistant_text="Act now.",
+                tool_calls=[ToolCall(call_id="act-1", name="act", arguments={})],
                 finish_reason="stop",
             ),
             ModelResponse(
@@ -108,25 +264,32 @@ class TestMemoryInteraction:
                 finish_reason="stop",
             ),
             ModelResponse(
-                assistant_text="Act and remember again.",
+                assistant_text="Remember one more.",
                 tool_calls=[
-                    ToolCall(call_id="act-2", name="act", arguments={}),
                     ToolCall(
                         call_id="write-3",
                         name="write_memory",
                         arguments={"text": "after-memory"},
-                    ),
+                    )
                 ],
                 finish_reason="stop",
             ),
             ModelResponse(
                 assistant_text="Read notes.",
-                tool_calls=[ToolCall(call_id="read", name="read_memory", arguments={})],
+                tool_calls=[
+                    ToolCall(
+                        call_id="read",
+                        name="read_memory",
+                        arguments={},
+                    )
+                ],
                 finish_reason="stop",
             ),
             ModelResponse(
-                assistant_text="Finish.",
-                tool_calls=[ToolCall(call_id="act-3", name="act", arguments={})],
+                assistant_text="Act and finish.",
+                tool_calls=[
+                    ToolCall(call_id="act-2", name="act", arguments={}),
+                ],
                 finish_reason="stop",
             ),
         ]
@@ -134,7 +297,7 @@ class TestMemoryInteraction:
             game=ContextGame(),
             agent=FakeAgent(responses=responses),
             run_dir=tmp_path / "run",
-            run_id="paired-context-test",
+            run_id="memory-context-test",
             max_turns=5,
         )
 
@@ -163,6 +326,10 @@ class TestMemoryInteraction:
                 self.calls = 0
 
             async def respond(self, request: Any) -> ModelResponse:
+                if not request.tools:
+                    return ModelResponse(
+                        assistant_text="", tool_calls=[], finish_reason="stop"
+                    )
                 self.calls += 1
                 if self.calls == 1:
                     return ModelResponse(
@@ -203,6 +370,10 @@ class TestMemoryInteraction:
 
         class CheckAgent:
             async def respond(self, request: Any) -> ModelResponse:
+                if not request.tools:
+                    return ModelResponse(
+                        assistant_text="", tool_calls=[], finish_reason="stop"
+                    )
                 observation = str(request.messages[0]["content"])
                 if "check" in observation:
                     action = "check"
@@ -362,47 +533,13 @@ class TestMemoryInteraction:
             "write",
             "write",
         ]
-        assert len(agent.requests) == 2
+        assert len(agent.requests) == 3
         assert [message["role"] for message in agent.requests[1].messages] == [
             "user",
             "assistant",
             "tool",
             "tool",
         ]
-
-    async def test_valid_game_action_with_accompanying_write_memory(
-        self, tmp_path: Path
-    ) -> None:
-        """A valid game action with an accompanying write_memory call."""
-        responses = [
-            ModelResponse(
-                assistant_text="I'll act and remember.",
-                tool_calls=[
-                    ToolCall(call_id="c1", name="act", arguments={}),
-                    ToolCall(
-                        call_id="c2",
-                        name="write_memory",
-                        arguments={"text": "note about rival"},
-                    ),
-                ],
-                finish_reason="stop",
-            ),
-        ]
-        engine = RunEngine(
-            game=TinyGame(max_actions=1),
-            agent=FakeAgent(responses=responses),
-            run_dir=tmp_path / "run",
-            run_id="test",
-            max_turns=5,
-            max_memory_operations_per_turn=4,
-        )
-        result = await engine.run()
-        assert result.success
-
-        events = _read_events(tmp_path / "run")
-        memory_events = [e for e in events if e["event_type"] == "memory_operation"]
-        assert len(memory_events) == 1
-        assert memory_events[0]["payload"]["operation"] == "write"
 
     async def test_read_memory_combined_with_game_action_retries(
         self, tmp_path: Path
@@ -481,6 +618,126 @@ class TestMemoryInteraction:
             for event in events
         )
 
+    async def test_system_summaries_are_stored_and_read_after_scope_change(
+        self, tmp_path: Path
+    ) -> None:
+        class SummarySession:
+            def __init__(self) -> None:
+                self._hand = 0
+                self._pending: list[MatchMemorySummary] = []
+
+            @property
+            def current_actor_id(self) -> str:
+                return "a"
+
+            @property
+            def conversation_scope_id(self) -> str:
+                return f"hand-{self._hand}"
+
+            def get_observation(self, actor_id: str) -> Observation:
+                return Observation(actor_id=actor_id, text=f"Hand {self._hand}.")
+
+            def get_tools(self, actor_id: str) -> list[ToolSpec]:
+                return [
+                    ToolSpec(
+                        name="act",
+                        description="Act",
+                        parameters={"type": "object", "properties": {}},
+                    )
+                ]
+
+            def apply_action(
+                self, actor_id: str, tool_name: str, arguments: dict[str, object]
+            ) -> Transition:
+                self._pending.append(
+                    MatchMemorySummary(
+                        actor_id=actor_id,
+                        text=f"summary for hand {self._hand}",
+                        hand=self._hand,
+                        turn=0,
+                    )
+                )
+                self._hand += 1
+                return Transition(summary="resolved")
+
+            def drain_match_memory_summaries(self) -> list[MatchMemorySummary]:
+                pending = list(self._pending)
+                self._pending.clear()
+                return pending
+
+            @property
+            def is_terminal(self) -> bool:
+                return self._hand >= 2
+
+            def get_result(self) -> GameResult:
+                return GameResult(completed=True, outcome={}, metrics={})
+
+        class SummaryGame:
+            @property
+            def name(self) -> str:
+                return "summary"
+
+            @property
+            def version(self) -> str:
+                return "1"
+
+            def system_prompt(self, actor_id: str) -> str:
+                return "Act."
+
+            def create_session(
+                self, *, seed: int, game_config: dict[str, object] | None = None
+            ) -> SummarySession:
+                return SummarySession()
+
+        responses = [
+            ModelResponse(
+                assistant_text="Act.",
+                tool_calls=[ToolCall(call_id="c1", name="act", arguments={})],
+                finish_reason="stop",
+            ),
+            ModelResponse(assistant_text="Done.", tool_calls=[], finish_reason="stop"),
+            ModelResponse(
+                assistant_text="Read memory.",
+                tool_calls=[ToolCall(call_id="c2", name="read_memory", arguments={})],
+                finish_reason="stop",
+            ),
+            ModelResponse(
+                assistant_text="Act again.",
+                tool_calls=[ToolCall(call_id="c3", name="act", arguments={})],
+                finish_reason="stop",
+            ),
+            ModelResponse(assistant_text="Done.", tool_calls=[], finish_reason="stop"),
+        ]
+
+        agent = FakeAgent(responses=responses)
+        engine = RunEngine(
+            game=SummaryGame(),
+            agent=agent,
+            run_dir=tmp_path / "run",
+            run_id="summary-test",
+            seed=42,
+            matches=1,
+            max_turns=10,
+            max_memory_operations_per_turn=4,
+        )
+
+        result = await engine.run()
+
+        assert result.success
+        assert len(agent.requests) >= 3
+        assert len(agent.requests[0].messages) == 1
+        assert len(agent.requests[2].messages) == 1
+
+        events = _read_events(tmp_path / "run")
+        read_event = next(
+            event
+            for event in events
+            if event["event_type"] == "memory_operation"
+            and event["payload"]["operation"] == "read"
+        )
+        assert read_event["payload"]["notes"]
+        assert read_event["payload"]["notes"][0]["source"] == "system"
+
     async def test_multiple_game_actions_retries(self, tmp_path: Path) -> None:
         """Multiple game actions in one response should retry."""
         bad_response = ModelResponse(
@@ -536,6 +793,103 @@ class TestMemoryInteraction:
         result = await engine.run()
         assert not result.success
 
+    async def test_memory_budget_rejects_each_over_budget_call_in_history(
+        self, tmp_path: Path
+    ) -> None:
+        response = ModelResponse(
+            assistant_text="I will write three notes.",
+            tool_calls=[
+                ToolCall(
+                    call_id=f"memory-{index}",
+                    name="write_memory",
+                    arguments={"text": f"note {index}"},
+                )
+                for index in range(1, 4)
+            ],
+            finish_reason="stop",
+        )
+        engine = RunEngine(
+            game=TinyGame(max_actions=1),
+            agent=FakeAgent(responses=response),
+            run_dir=tmp_path / "run",
+            run_id="memory-budget-history-test",
+            max_turns=1,
+            max_memory_operations_per_turn=2,
+        )
+
+        result = await engine.run()
+
+        assert not result.success
+        events = _read_events(tmp_path / "run")
+        match_end = next(
+            event for event in events if event["event_type"] == "match_end"
+        )
+        assert match_end["payload"]["result"]["outcome"]["total_actions"] == 0
+
+        transcript = engine._actor_transcripts["a"]
+        assistant_message = next(
+            message for message in transcript if message["role"] == "assistant"
+        )
+        tool_results = [message for message in transcript if message["role"] == "tool"]
+        assert [call["id"] for call in assistant_message["tool_calls"]] == [
+            "memory-1",
+            "memory-2",
+            "memory-3",
+        ]
+        assert [result["tool_call_id"] for result in tool_results] == [
+            "memory-1",
+            "memory-2",
+            "memory-3",
+        ]
+        assert json.loads(str(tool_results[-1]["content"])) == {
+            "error": "Memory operation budget exceeded"
+        }
+
+    async def test_memory_budget_rejects_remaining_announced_calls_in_history(
+        self, tmp_path: Path
+    ) -> None:
+        response = ModelResponse(
+            assistant_text="I will write four notes.",
+            tool_calls=[
+                ToolCall(
+                    call_id=f"memory-{index}",
+                    name="write_memory",
+                    arguments={"text": f"note {index}"},
+                )
+                for index in range(1, 5)
+            ],
+            finish_reason="stop",
+        )
+        engine = RunEngine(
+            game=TinyGame(max_actions=1),
+            agent=FakeAgent(responses=response),
+            run_dir=tmp_path / "run",
+            run_id="memory-budget-remaining-history-test",
+            max_turns=1,
+            max_memory_operations_per_turn=2,
+        )
+
+        result = await engine.run()
+
+        assert not result.success
+        transcript = engine._actor_transcripts["a"]
+        assistant_message = next(
+            message for message in transcript if message["role"] == "assistant"
+        )
+        tool_results = [message for message in transcript if message["role"] == "tool"]
+        assert [call["id"] for call in assistant_message["tool_calls"]] == [
+            "memory-1",
+            "memory-2",
+            "memory-3",
+            "memory-4",
+        ]
+        assert [result["tool_call_id"] for result in tool_results] == [
+            "memory-1",
+            "memory-2",
+            "memory-3",
+            "memory-4",
+        ]
+
     async def test_write_with_invalid_action_discards_note(
         self, tmp_path: Path
     ) -> None:
@@ -568,7 +922,7 @@ class TestMemoryInteraction:
         result = await engine.run()
         assert result.success
 
-    async def test_invalid_paired_write_retries_without_applying_action(
+    async def test_mixed_memory_action_response_retries_without_applying_action(
         self, tmp_path: Path
     ) -> None:
         bad_response = ModelResponse(
@@ -608,7 +962,7 @@ class TestMemoryInteraction:
             if event["event_type"] == "validation"
             and event["payload"].get("valid") is False
         ]
-        assert "invalid_memory_write" in validation_errors
+        assert "memory_with_game_action" in validation_errors
         assert not any(
             event["event_type"] == "memory_operation"
             and event["payload"]["operation"] == "write"

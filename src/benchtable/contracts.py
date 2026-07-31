@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+import json
+import math
+from typing import Any, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------
 # JSON-compatible type aliases
@@ -67,11 +77,18 @@ class ToolCall(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    call_id: str
+    call_id: StrictStr = Field(..., min_length=1)
     name: str
     arguments: JsonObject | None = None
     raw_arguments: str | None = None
     parse_error: str | None = None
+
+    @field_validator("call_id")
+    @classmethod
+    def reject_blank_call_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("call_id must not be empty or whitespace-only")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -118,6 +135,21 @@ class ModelResponse(BaseModel):
     usage: Usage | None = None
     raw_provider_response: JsonObject | None = None
 
+    @model_validator(mode="after")
+    def reject_duplicate_tool_call_ids(self) -> Self:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for tool_call in self.tool_calls:
+            if tool_call.call_id in seen and tool_call.call_id not in duplicates:
+                duplicates.append(tool_call.call_id)
+            seen.add(tool_call.call_id)
+        if duplicates:
+            raise ValueError(
+                "duplicate call_id values are not allowed: "
+                + ", ".join(repr(call_id) for call_id in duplicates)
+            )
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Game result and transition
@@ -133,6 +165,61 @@ class Transition(BaseModel):
     metrics: GameMetrics = Field(default_factory=dict)
 
 
+class PluginEvent(BaseModel):
+    """A typed event emitted by a game session for the generic trace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: StrictStr = Field(..., min_length=1)
+    payload: JsonObject = Field(default_factory=dict)
+
+    @field_validator("event_type")
+    @classmethod
+    def reject_blank_event_type(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("event_type must not be empty or whitespace-only")
+        return value
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def reject_non_json_types(cls, value: object) -> object:
+        try:
+            _validate_json_value(value)
+        except ValueError as exc:
+            raise ValueError("payload must be JSON-compatible") from exc
+        return value
+
+    @field_validator("payload")
+    @classmethod
+    def reject_non_json_values(cls, value: JsonObject) -> JsonObject:
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("payload must be JSON-compatible") from exc
+        return value
+
+
+def _validate_json_value(value: object) -> None:
+    """Reject values Pydantic could otherwise coerce into JSON types."""
+    if value is None or type(value) in {str, int, bool}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("non-finite numbers are not JSON-compatible")
+        return
+    if type(value) is list:
+        for item in cast(list[object], value):
+            _validate_json_value(item)
+        return
+    if type(value) is dict:
+        for key, item in cast(dict[object, object], value).items():
+            if type(key) is not str:
+                raise ValueError("JSON object keys must be strings")
+            _validate_json_value(item)
+        return
+    raise ValueError("value is not JSON-compatible")
+
+
 class GameResult(BaseModel):
     """Terminal outcome of a game session."""
 
@@ -141,3 +228,28 @@ class GameResult(BaseModel):
     completed: bool
     outcome: JsonObject = Field(default_factory=dict)
     metrics: GameMetrics = Field(default_factory=dict)
+
+
+class MatchMemorySummary(BaseModel):
+    """A compact public memory summary for one actor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor_id: StrictStr = Field(..., min_length=1)
+    text: str = Field(..., min_length=1)
+    hand: StrictInt = Field(..., ge=0)
+    turn: StrictInt = Field(..., ge=0)
+
+    @field_validator("actor_id")
+    @classmethod
+    def reject_blank_actor_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("actor_id must not be empty or whitespace-only")
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text must not be empty or whitespace-only")
+        return value

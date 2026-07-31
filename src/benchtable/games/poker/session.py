@@ -9,7 +9,9 @@ from benchtable.contracts import (
     GameMetrics,
     GameResult,
     JsonObject,
+    MatchMemorySummary,
     Observation,
+    PluginEvent,
     ToolSpec,
     Transition,
 )
@@ -90,6 +92,7 @@ class _HandState:
     burn_cards: list[Card] = field(default_factory=_empty_card_list)
     action_history: list[str] = field(default_factory=_empty_str_list)
     pending_actors: list[str] = field(default_factory=_empty_str_list)
+    start_stacks: dict[str, int] = field(default_factory=_empty_str_int_dict)
 
 
 @dataclass(frozen=True)
@@ -146,8 +149,6 @@ class PokerSession:
         self._hand_index = 0
         self._hands_played = 0
         self._match_over = False
-        self._last_hand_summary = ""
-        self._hand_summaries: list[str] = []
         self._public_hand_summaries: list[JsonObject] = []
         self._failure_calls: list[str] = []
         self._recovery_count = 0
@@ -155,6 +156,7 @@ class PokerSession:
         self._finish_reason: str | None = None
         self._wins: dict[str, int] = {pid: 0 for pid in players}
         self._hand_events: list[JsonObject] = []
+        self._pending_memory_summaries: list[MatchMemorySummary] = []
         self._current_actor_id = ""
         self._current_actor_index = 0
         self._active_order: list[str] = []
@@ -200,6 +202,7 @@ class PokerSession:
             self._players[pid].all_in = False
             self._hand.hand_contributions[pid] = 0
             self._hand.street_contributions[pid] = 0
+            self._hand.start_stacks[pid] = self._players[pid].stack
 
         for _ in range(2):
             for pid in active:
@@ -303,6 +306,10 @@ class PokerSession:
         return True
 
     @property
+    def conversation_scope_id(self) -> str:
+        return f"hand-{self._hand_index}"
+
+    @property
     def memory_max_entries(self) -> int:
         return self._memory_max_entries
 
@@ -351,9 +358,6 @@ class PokerSession:
             parts.append("Action history:")
             for entry in hand.action_history:
                 parts.append(f"  {entry}")
-
-        if self._last_hand_summary:
-            parts.append(f"Previous hand: {self._last_hand_summary}")
 
         return Observation(
             actor_id=actor_id,
@@ -434,10 +438,12 @@ class PokerSession:
             actions.append(PokerAction.CALL)
 
         if player.stack > 0:
-            if state.current_bet == 0:
+            if state.current_bet == 0 and self._bet_is_available(state):
                 actions.append(PokerAction.BET)
-            elif (state.bet_open or hand.street == Street.PREFLOP) and (
-                actor_id not in hand.acted_this_round
+            elif (
+                (state.bet_open or hand.street == Street.PREFLOP)
+                and actor_id not in hand.acted_this_round
+                and self._raise_is_available(state)
             ):
                 actions.append(PokerAction.RAISE)
             all_in_street_bet = state.street_commitment + state.available_stack
@@ -446,6 +452,18 @@ class PokerSession:
                 actions.append(PokerAction.ALL_IN)
 
         return actions
+
+    @staticmethod
+    def _bet_is_available(state: _ActionState) -> bool:
+        max_street_bet = state.street_commitment + state.available_stack - 1
+        return max_street_bet >= state.minimum_raise
+
+    @staticmethod
+    def _raise_is_available(state: _ActionState) -> bool:
+        if state.available_stack <= 1:
+            return False
+        max_street_bet = state.street_commitment + state.available_stack - 1
+        return max_street_bet - state.current_bet >= state.minimum_raise
 
     def _can_act(self, actor_id: str) -> bool:
         player = self._players[actor_id]
@@ -716,7 +734,9 @@ class PokerSession:
             hand.burn_cards.append(hand.deck.draw(1)[0])
             hand.community.extend(hand.deck.draw(1))
 
-        if not self._set_next_actionable(hand.dealer_id):
+        if not self._set_next_actionable(
+            hand.dealer_id, include_start=len(non_folded) == 2
+        ):
             self._runout_remaining()
 
     def _runout_remaining(self) -> None:
@@ -810,23 +830,40 @@ class PokerSession:
         else:
             summary = "Hand ended with no active players"
 
-        self._last_hand_summary = summary
-        self._hand_summaries.append(summary)
+        seat_deltas = {
+            pid: self._players[pid].stack
+            - hand.start_stacks.get(pid, self._players[pid].stack)
+            for pid in self._active_order
+            if pid in hand.start_stacks
+        }
+        seat_delta_text = ", ".join(
+            f"{pid} {delta:+d}" for pid, delta in seat_deltas.items()
+        )
+        compact_summary = (
+            f"Hand {hand.hand_index} finished by {finish_reason}. "
+            f"Seat deltas: {seat_delta_text}"
+        )
         public_summary = cast(
             JsonObject,
             {
                 "hand_index": hand.hand_index,
-                "seed": hand.seed,
-                "dealer": hand.dealer_id,
-                "board": [str(card) for card in hand.community],
                 "finish_reason": finish_reason,
-                "summary": summary,
+                "summary": compact_summary,
+                "seat_deltas": seat_deltas,
                 "payouts": dict(payouts),
-                "uncalled_returns": dict(uncalled_returns),
-                "settlement": settlement,
             },
         )
         self._public_hand_summaries.append(public_summary)
+
+        for pid in self._active_order:
+            self._pending_memory_summaries.append(
+                MatchMemorySummary(
+                    actor_id=pid,
+                    text=compact_summary,
+                    hand=hand.hand_index,
+                    turn=self._in_hand_turn,
+                )
+            )
 
         self._hand_events.append(
             cast(
@@ -868,10 +905,23 @@ class PokerSession:
     def is_terminal(self) -> bool:
         return self._match_over
 
-    def drain_hand_events(self) -> list[JsonObject]:
+    def drain_hand_events(self) -> list[PluginEvent]:
         events = list(self._hand_events)
         self._hand_events.clear()
-        return events
+        return [
+            PluginEvent(
+                event_type=cast(str, event["event_type"]),
+                payload={
+                    key: value for key, value in event.items() if key != "event_type"
+                },
+            )
+            for event in events
+        ]
+
+    def drain_match_memory_summaries(self) -> list[MatchMemorySummary]:
+        summaries = list(self._pending_memory_summaries)
+        self._pending_memory_summaries.clear()
+        return summaries
 
     def get_result(self) -> GameResult:
         stacks: dict[str, int] = {

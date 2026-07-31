@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
-from benchtable.contracts import JsonObject, ToolSpec
+from benchtable.contracts import JsonObject, MatchMemorySummary, ToolSpec
 
 
 @dataclass(frozen=True)
@@ -17,11 +17,11 @@ class _MemoryNote:
 
 
 @dataclass(frozen=True)
-class PreparedMemoryBatch:
-    """Validated immutable entries ready for a no-fail commit."""
-
-    actor_id: str
-    entries: tuple[tuple[str, int, int], ...]
+class _MemorySummary:
+    sequence: int
+    text: str
+    hand: int
+    turn: int
 
 
 class MatchMemory:
@@ -43,54 +43,21 @@ class MatchMemory:
         self._max_entries = max_entries
         self._max_chars = max_chars
         self._notes: dict[str, list[_MemoryNote]] = {}
+        self._summaries: dict[str, list[_MemorySummary]] = {}
         self._next_sequence = 1
 
-    def validate_write_batch(
-        self, actor_id: str, entries: list[tuple[str, int, int]]
-    ) -> None:
-        """Validate a batch of writes without mutating state.
-
-        entries is a list of (text, hand, turn) tuples.
-        Raises ValueError if any entry is invalid or limits would be exceeded.
-        """
-        actor_notes = self._notes.get(actor_id, [])
-        current_count = len(actor_notes)
-        current_chars = sum(len(note.text) for note in actor_notes)
-
-        for text, _hand, _turn in entries:
-            if type(text) is not str or not text.strip():
-                raise ValueError("Note text must not be empty or whitespace-only")
-            if current_count >= self._max_entries:
-                raise ValueError(
-                    f"Entry limit reached ({self._max_entries} entries per actor)"
-                )
-            current_chars += len(text)
-            if current_chars > self._max_chars:
-                raise ValueError(
-                    f"Character limit reached ({self._max_chars} chars per actor)"
-                )
-            current_count += 1
-
-    def prepare_write_batch(
-        self, actor_id: str, entries: list[tuple[str, int, int]]
-    ) -> PreparedMemoryBatch:
-        """Validate entries and freeze them for a later commit."""
-        self.validate_write_batch(actor_id, entries)
-        return PreparedMemoryBatch(actor_id=actor_id, entries=tuple(entries))
-
-    def commit_batch(self, batch: PreparedMemoryBatch) -> None:
-        """Append a previously validated batch without another rejection point."""
-        actor_notes = self._notes.setdefault(batch.actor_id, [])
-        for text, hand, turn in batch.entries:
-            actor_notes.append(
-                _MemoryNote(
-                    sequence=self._next_sequence,
-                    text=text,
-                    hand=hand,
-                    turn=turn,
-                )
+    def append_summary(self, summary: MatchMemorySummary) -> None:
+        """Append a public system summary for the target actor."""
+        summaries = self._summaries.setdefault(summary.actor_id, [])
+        summaries.append(
+            _MemorySummary(
+                sequence=self._next_sequence,
+                text=summary.text,
+                hand=summary.hand,
+                turn=summary.turn,
             )
-            self._next_sequence += 1
+        )
+        self._next_sequence += 1
 
     def write(self, actor_id: str, *, text: str, hand: int, turn: int) -> None:
         """Append a note for the given actor.
@@ -124,27 +91,48 @@ class MatchMemory:
         self._next_sequence += 1
 
     def read(self, actor_id: str) -> list[JsonObject]:
-        """Return the actor's notes in insertion order (copy-safe)."""
-        notes = self._notes.get(actor_id, [])
-        return [
-            cast(
-                JsonObject,
-                {
-                    "sequence": note.sequence,
-                    "text": note.text,
-                    "hand": note.hand,
-                    "turn": note.turn,
-                },
+        """Return the actor's notes and summaries in insertion order."""
+        entries: list[tuple[int, JsonObject]] = []
+        for note in self._notes.get(actor_id, []):
+            entries.append(
+                (
+                    note.sequence,
+                    cast(
+                        JsonObject,
+                        {
+                            "source": "agent",
+                            "sequence": note.sequence,
+                            "text": note.text,
+                            "hand": note.hand,
+                            "turn": note.turn,
+                        },
+                    ),
+                )
             )
-            for note in notes
-        ]
+        for summary in self._summaries.get(actor_id, []):
+            entries.append(
+                (
+                    summary.sequence,
+                    cast(
+                        JsonObject,
+                        {
+                            "source": "system",
+                            "sequence": summary.sequence,
+                            "text": summary.text,
+                            "hand": summary.hand,
+                            "turn": summary.turn,
+                        },
+                    ),
+                )
+            )
+        return [entry for _sequence, entry in sorted(entries, key=lambda item: item[0])]
 
     @staticmethod
     def read_tool_spec() -> ToolSpec:
         """Return the reserved read_memory tool specification."""
         return ToolSpec(
             name="read_memory",
-            description="Read your private notes from memory.",
+            description="Read your private notes and system summaries from memory.",
             parameters={
                 "type": "object",
                 "properties": {},

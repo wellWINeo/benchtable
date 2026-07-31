@@ -12,12 +12,26 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from benchtable.agents.protocol import Agent, AgentRequest
-from benchtable.contracts import JsonObject, ModelResponse, ToolCall, Transition
+from benchtable.contracts import (
+    JsonObject,
+    MatchMemorySummary,
+    ModelResponse,
+    PluginEvent,
+    ToolCall,
+    Transition,
+)
 from benchtable.errors import InvalidActionError, ProviderError, RunError
-from benchtable.events import EventWriter
+from benchtable.events import (
+    EventWriter,
+    redact_json_text,
+    redact_text,
+    redact_value,
+)
 from benchtable.games.protocol import GamePlugin, GameSession
-from benchtable.memory import MatchMemory, PreparedMemoryBatch
+from benchtable.memory import MatchMemory
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,7 @@ class _ActionResponse:
     memory_calls: tuple[ToolCall, ...]
     game_calls: tuple[ToolCall, ...]
     memory_operations: int
+    invalid_attempts: int
 
 
 _RESERVED_MEMORY_TOOLS = frozenset({"read_memory", "write_memory"})
@@ -107,6 +122,8 @@ class RunEngine:
                 "max_memory_operations_per_turn must be a non-negative integer"
             )
         self._max_memory_operations_per_turn = max_memory_operations_per_turn
+        self._actor_transcripts: dict[str, list[JsonObject]] = {}
+        self._conversation_scope_id: str | None = None
 
     async def run(self) -> RunResult:
         """Execute all matches and write the trace."""
@@ -197,6 +214,8 @@ class RunEngine:
     async def _run_match(self, writer: EventWriter, match_idx: int) -> _MatchOutcome:
         match_id = f"match-{match_idx}"
         seed = self._derive_match_seed(match_idx)
+        self._actor_transcripts = {}
+        self._conversation_scope_id = None
         metrics: dict[str, Any] = {
             "turn_count": 0,
             "invalid_actions": 0,
@@ -266,14 +285,6 @@ class RunEngine:
             )
             return _MatchOutcome(False)
 
-        self._drain_plugin_events(
-            writer,
-            session,
-            match_id,
-            turn_index=None,
-            actor_id=getattr(session, "current_actor_id", None),
-        )
-
         try:
             memory = MatchMemory(
                 max_entries=getattr(session, "memory_max_entries", 100),
@@ -309,9 +320,26 @@ class RunEngine:
             return _MatchOutcome(False)
 
         try:
+            self._drain_plugin_events(
+                writer,
+                session,
+                match_id,
+                turn_index=None,
+                actor_id=getattr(session, "current_actor_id", None),
+            )
+            self._drain_match_memory_summaries(
+                writer,
+                session,
+                memory,
+                match_id,
+                turn_idx=None,
+                actor_id=getattr(session, "current_actor_id", None),
+            )
             for turn_idx in range(self._max_turns):
                 if session.is_terminal:
-                    return self._complete_match(writer, session, match_id, metrics)
+                    return self._complete_match(
+                        writer, session, memory, match_id, metrics
+                    )
 
                 turn_result = await self._run_turn(
                     writer, session, memory, match_id, turn_idx, metrics
@@ -321,6 +349,7 @@ class RunEngine:
                     failure_outcome = self._fail_match(
                         writer,
                         session,
+                        memory,
                         match_id,
                         metrics,
                         turn_result,
@@ -330,27 +359,35 @@ class RunEngine:
                     return failure_outcome
 
                 if turn_result == "terminal":
-                    return self._complete_match(writer, session, match_id, metrics)
+                    return self._complete_match(
+                        writer, session, memory, match_id, metrics
+                    )
 
             if session.is_terminal:
-                return self._complete_match(writer, session, match_id, metrics)
+                return self._complete_match(writer, session, memory, match_id, metrics)
 
+            outcome, game_metrics = self._failure_result(session)
             self._emit_match_end(
                 writer,
                 match_id,
                 metrics,
                 completed=False,
                 failure_reason="max_turns_exceeded",
+                outcome=outcome,
+                game_metrics=game_metrics,
             )
             return _MatchOutcome(False)
         except asyncio.CancelledError:
             writer.emit("cancellation", {"phase": "match"}, match_id=match_id)
+            outcome, game_metrics = self._failure_result(session)
             self._emit_match_end(
                 writer,
                 match_id,
                 metrics,
                 completed=False,
                 failure_reason="cancelled",
+                outcome=outcome,
+                game_metrics=game_metrics,
             )
             return _MatchOutcome(False, cancelled=True)
         except Exception as exc:
@@ -359,12 +396,15 @@ class RunEngine:
                 {"phase": "match", "error": str(exc)},
                 match_id=match_id,
             )
+            outcome, game_metrics = self._failure_result(session)
             self._emit_match_end(
                 writer,
                 match_id,
                 metrics,
                 completed=False,
                 failure_reason="engine_failure",
+                outcome=outcome,
+                game_metrics=game_metrics,
             )
             return _MatchOutcome(False)
 
@@ -389,6 +429,11 @@ class RunEngine:
                 actor_id=actor_id,
             )
             observation = session.get_observation(actor_id)
+            if observation.actor_id != actor_id:
+                raise RunError(
+                    "Observation actor_id does not match current actor_id: "
+                    f"{observation.actor_id!r} != {actor_id!r}"
+                )
             game_tools = session.get_tools(actor_id)
             system_prompt = self._game.system_prompt(actor_id)
         except asyncio.CancelledError:
@@ -457,12 +502,19 @@ class RunEngine:
             actor_id=actor_id,
         )
 
-        messages: list[JsonObject] = [{"role": "user", "content": observation.text}]
-        request = AgentRequest(
-            actor_id=actor_id,
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=all_tools,
+        scope_id = self._conversation_scope(session, match_id)
+        if self._conversation_scope_id != scope_id:
+            self._actor_transcripts = {}
+            self._conversation_scope_id = scope_id
+        transcript = self._actor_transcripts.setdefault(actor_id, [])
+        transcript.append(
+            cast(JsonObject, {"role": "user", "content": observation.text})
+        )
+        request = self._request_from_transcript(
+            actor_id,
+            system_prompt,
+            transcript,
+            all_tools,
         )
 
         action_response = await self._get_action_response(
@@ -476,6 +528,7 @@ class RunEngine:
             turn_idx,
             actor_id,
             metrics,
+            transcript,
         )
         if isinstance(action_response, _TurnFailure):
             return action_response
@@ -484,31 +537,35 @@ class RunEngine:
         memory_calls = list(action_response.memory_calls)
         game_calls = list(action_response.game_calls)
         memory_ops_this_turn = action_response.memory_operations
+        invalid_attempts = action_response.invalid_attempts
 
         # Phase 2: Handle game action with retry loop
-        for invalid_attempt in range(self._max_invalid_attempts + 1):
-            # Check for read_memory combined with game action
-            has_read = any(c.name == "read_memory" for c in memory_calls)
-            if has_read and game_calls:
+        while True:
+            # Memory calls cannot be combined with a game action.
+            if memory_calls and game_calls:
                 self._emit_validation_failure(
                     writer,
                     match_id,
                     turn_idx,
                     actor_id,
                     response,
-                    "read_memory_with_game_action",
+                    "memory_with_game_action",
                 )
                 metrics["invalid_actions"] += 1
-                if invalid_attempt >= self._max_invalid_attempts:
+                invalid_attempts += 1
+                request = self._retry_request(
+                    request,
+                    response,
+                    "memory_with_game_action",
+                    transcript,
+                )
+                if invalid_attempts > self._max_invalid_attempts:
                     return _TurnFailure(
                         "invalid_attempts_exhausted",
                         actor_id=actor_id,
                         turn_index=turn_idx,
                         recover=True,
                     )
-                request = self._retry_request(
-                    request, response, "read_memory_with_game_action"
-                )
                 action_response = await self._get_action_response(
                     writer,
                     session,
@@ -521,6 +578,8 @@ class RunEngine:
                     actor_id,
                     metrics,
                     memory_operations=memory_ops_this_turn,
+                    transcript=transcript,
+                    invalid_attempts=invalid_attempts,
                 )
                 if isinstance(action_response, _TurnFailure):
                     return action_response
@@ -529,6 +588,7 @@ class RunEngine:
                 memory_calls = list(action_response.memory_calls)
                 game_calls = list(action_response.game_calls)
                 memory_ops_this_turn = action_response.memory_operations
+                invalid_attempts = action_response.invalid_attempts
                 continue
 
             # Multiple game actions
@@ -542,14 +602,17 @@ class RunEngine:
                     "multiple_tool_calls",
                 )
                 metrics["invalid_actions"] += 1
-                if invalid_attempt >= self._max_invalid_attempts:
+                invalid_attempts += 1
+                request = self._retry_request(
+                    request, response, "multiple_tool_calls", transcript
+                )
+                if invalid_attempts > self._max_invalid_attempts:
                     return _TurnFailure(
                         "invalid_attempts_exhausted",
                         actor_id=actor_id,
                         turn_index=turn_idx,
                         recover=True,
                     )
-                request = self._retry_request(request, response, "multiple_tool_calls")
                 action_response = await self._get_action_response(
                     writer,
                     session,
@@ -562,6 +625,8 @@ class RunEngine:
                     actor_id,
                     metrics,
                     memory_operations=memory_ops_this_turn,
+                    transcript=transcript,
+                    invalid_attempts=invalid_attempts,
                 )
                 if isinstance(action_response, _TurnFailure):
                     return action_response
@@ -570,6 +635,7 @@ class RunEngine:
                 memory_calls = list(action_response.memory_calls)
                 game_calls = list(action_response.game_calls)
                 memory_ops_this_turn = action_response.memory_operations
+                invalid_attempts = action_response.invalid_attempts
                 continue
 
             tool_call = game_calls[0]
@@ -585,14 +651,17 @@ class RunEngine:
                     "malformed_arguments",
                 )
                 metrics["invalid_actions"] += 1
-                if invalid_attempt >= self._max_invalid_attempts:
+                invalid_attempts += 1
+                request = self._retry_request(
+                    request, response, "malformed_arguments", transcript
+                )
+                if invalid_attempts > self._max_invalid_attempts:
                     return _TurnFailure(
                         "invalid_attempts_exhausted",
                         actor_id=actor_id,
                         turn_index=turn_idx,
                         recover=True,
                     )
-                request = self._retry_request(request, response, "malformed_arguments")
                 action_response = await self._get_action_response(
                     writer,
                     session,
@@ -605,6 +674,8 @@ class RunEngine:
                     actor_id,
                     metrics,
                     memory_operations=memory_ops_this_turn,
+                    transcript=transcript,
+                    invalid_attempts=invalid_attempts,
                 )
                 if isinstance(action_response, _TurnFailure):
                     return action_response
@@ -613,6 +684,7 @@ class RunEngine:
                 memory_calls = list(action_response.memory_calls)
                 game_calls = list(action_response.game_calls)
                 memory_ops_this_turn = action_response.memory_operations
+                invalid_attempts = action_response.invalid_attempts
                 continue
 
             # Unknown game action
@@ -626,96 +698,20 @@ class RunEngine:
                     "invalid_action",
                 )
                 metrics["invalid_actions"] += 1
-                if invalid_attempt >= self._max_invalid_attempts:
-                    return _TurnFailure(
-                        "invalid_attempts_exhausted",
-                        actor_id=actor_id,
-                        turn_index=turn_idx,
-                        recover=True,
-                    )
-                request = self._retry_request(request, response, "invalid_action")
-                action_response = await self._get_action_response(
-                    writer,
-                    session,
-                    memory,
+                invalid_attempts += 1
+                request = self._retry_request(
                     request,
-                    all_tools,
-                    system_prompt,
-                    match_id,
-                    turn_idx,
-                    actor_id,
-                    metrics,
-                    memory_operations=memory_ops_this_turn,
-                )
-                if isinstance(action_response, _TurnFailure):
-                    return action_response
-                request = action_response.request
-                response = action_response.response
-                memory_calls = list(action_response.memory_calls)
-                game_calls = list(action_response.game_calls)
-                memory_ops_this_turn = action_response.memory_operations
-                continue
-
-            # Validate every paired write before applying the game action.
-            hand_idx, in_hand_turn = self._memory_context(session, turn_idx)
-            staged_writes: list[tuple[str, int, int]] = []
-            prepared_writes: PreparedMemoryBatch | None = None
-            invalid_write: str | None = None
-            for mc in memory_calls:
-                if mc.name != "write_memory":
-                    continue
-                memory_ops_this_turn += 1
-                if memory_ops_this_turn > self._max_memory_operations_per_turn:
-                    writer.emit(
-                        "memory_operation",
-                        {
-                            "operation": "budget_exhausted",
-                            "tool_name": "write_memory",
-                        },
-                        match_id=match_id,
-                        turn_index=turn_idx,
-                        actor_id=actor_id,
-                    )
-                    return _TurnFailure(
-                        "memory_budget_exhausted",
-                        actor_id=actor_id,
-                        turn_index=turn_idx,
-                    )
-                text_val = (
-                    mc.arguments.get("text") if mc.arguments is not None else None
-                )
-                if not isinstance(text_val, str) or not text_val.strip():
-                    invalid_write = "Memory write text must not be empty"
-                    break
-                staged_writes.append((text_val, hand_idx, in_hand_turn))
-
-            if invalid_write is None and staged_writes:
-                try:
-                    prepared_writes = memory.prepare_write_batch(
-                        actor_id, staged_writes
-                    )
-                except ValueError as exc:
-                    invalid_write = str(exc)
-
-            if invalid_write is not None:
-                self._emit_validation_failure(
-                    writer,
-                    match_id,
-                    turn_idx,
-                    actor_id,
                     response,
-                    "invalid_memory_write",
-                    details=invalid_write,
+                    "invalid_action",
+                    transcript,
                 )
-                metrics["invalid_actions"] += 1
-                if invalid_attempt >= self._max_invalid_attempts:
+                if invalid_attempts > self._max_invalid_attempts:
                     return _TurnFailure(
                         "invalid_attempts_exhausted",
                         actor_id=actor_id,
                         turn_index=turn_idx,
                         recover=True,
                     )
-                request = self._retry_request(request, response, "invalid_memory_write")
                 action_response = await self._get_action_response(
                     writer,
                     session,
@@ -728,6 +724,8 @@ class RunEngine:
                     actor_id,
                     metrics,
                     memory_operations=memory_ops_this_turn,
+                    transcript=transcript,
+                    invalid_attempts=invalid_attempts,
                 )
                 if isinstance(action_response, _TurnFailure):
                     return action_response
@@ -736,7 +734,10 @@ class RunEngine:
                 memory_calls = list(action_response.memory_calls)
                 game_calls = list(action_response.game_calls)
                 memory_ops_this_turn = action_response.memory_operations
+                invalid_attempts = action_response.invalid_attempts
                 continue
+
+            transcript.append(self._assistant_tool_message(response))
 
             try:
                 transition = session.apply_action(
@@ -755,15 +756,22 @@ class RunEngine:
                     details=str(exc),
                 )
                 metrics["invalid_actions"] += 1
-                staged_writes = []
-                if invalid_attempt >= self._max_invalid_attempts:
+                invalid_attempts += 1
+                request = self._retry_request(
+                    request,
+                    response,
+                    "invalid_action",
+                    transcript,
+                    detail=str(exc),
+                    details=exc.details,
+                )
+                if invalid_attempts > self._max_invalid_attempts:
                     return _TurnFailure(
                         "invalid_attempts_exhausted",
                         actor_id=actor_id,
                         turn_index=turn_idx,
                         recover=True,
                     )
-                request = self._retry_request(request, response, "invalid_action")
                 action_response = await self._get_action_response(
                     writer,
                     session,
@@ -776,6 +784,8 @@ class RunEngine:
                     actor_id,
                     metrics,
                     memory_operations=memory_ops_this_turn,
+                    transcript=transcript,
+                    invalid_attempts=invalid_attempts,
                 )
                 if isinstance(action_response, _TurnFailure):
                     return action_response
@@ -784,6 +794,7 @@ class RunEngine:
                 memory_calls = list(action_response.memory_calls)
                 game_calls = list(action_response.game_calls)
                 memory_ops_this_turn = action_response.memory_operations
+                invalid_attempts = action_response.invalid_attempts
                 continue
             except asyncio.CancelledError:
                 writer.emit(
@@ -812,18 +823,6 @@ class RunEngine:
                     turn_index=turn_idx,
                 )
 
-            # Success - commit staged writes
-            if prepared_writes is not None:
-                memory.commit_batch(prepared_writes)
-            for text_val, _hand, _turn in staged_writes:
-                writer.emit(
-                    "memory_operation",
-                    {"operation": "write", "text_length": len(text_val)},
-                    match_id=match_id,
-                    turn_index=turn_idx,
-                    actor_id=actor_id,
-                )
-
             writer.emit(
                 "validation",
                 {"valid": True, "tool_name": tool_call.name},
@@ -845,6 +844,50 @@ class RunEngine:
                 turn_index=turn_idx,
                 actor_id=actor_id,
             )
+
+            transcript.append(
+                cast(
+                    JsonObject,
+                    {
+                        "role": "tool",
+                        "content": json.dumps(
+                            {
+                                "summary": transition.summary,
+                                "metrics": transition.metrics,
+                                "terminal": session.is_terminal,
+                            }
+                        ),
+                        "tool_call_id": tool_call.call_id,
+                    },
+                )
+            )
+
+            self._drain_match_memory_summaries(
+                writer,
+                session,
+                memory,
+                match_id,
+                turn_idx,
+                actor_id,
+            )
+
+            finalization_result = await self._finalize_turn(
+                writer,
+                request=self._request_from_transcript(
+                    actor_id,
+                    system_prompt,
+                    transcript,
+                    [],
+                ),
+                match_id=match_id,
+                turn_idx=turn_idx,
+                actor_id=actor_id,
+                metrics=metrics,
+                transcript=transcript,
+            )
+            if isinstance(finalization_result, _TurnFailure):
+                return finalization_result
+
             writer.emit(
                 "turn_end",
                 {"status": "ok"},
@@ -873,10 +916,11 @@ class RunEngine:
         turn_idx: int,
         actor_id: str,
         metrics: dict[str, Any],
+        transcript: list[JsonObject],
         memory_operations: int = 0,
+        invalid_attempts: int = 0,
     ) -> _ActionResponse | _TurnFailure:
         """Return a response containing a game call after memory-only calls."""
-        no_tool_attempts = 0
         while True:
             response_or_failure = await self._get_response(
                 writer,
@@ -903,15 +947,17 @@ class RunEngine:
                     "no_tool_calls",
                 )
                 metrics["invalid_actions"] += 1
-                no_tool_attempts += 1
-                if no_tool_attempts > self._max_invalid_attempts:
+                invalid_attempts += 1
+                request = self._retry_request(
+                    request, response, "no_tool_calls", transcript
+                )
+                if invalid_attempts > self._max_invalid_attempts:
                     return _TurnFailure(
                         "invalid_attempts_exhausted",
                         actor_id=actor_id,
                         turn_index=turn_idx,
                         recover=True,
                     )
-                request = self._retry_request(request, response, "no_tool_calls")
                 continue
 
             memory_calls = tuple(
@@ -926,26 +972,44 @@ class RunEngine:
             )
             if game_calls:
                 return _ActionResponse(
-                    request=request,
+                    request=self._request_from_transcript(
+                        actor_id,
+                        system_prompt,
+                        transcript,
+                        all_tools,
+                    ),
                     response=response,
                     memory_calls=memory_calls,
                     game_calls=game_calls,
                     memory_operations=memory_operations,
+                    invalid_attempts=invalid_attempts,
                 )
 
             hand_idx, in_hand_turn = self._memory_context(session, turn_idx)
-            messages = list(request.messages)
-            messages.append(self._assistant_tool_message(response))
-            for mem_call in memory_calls:
+            transcript.append(self._assistant_tool_message(response))
+            for memory_index, mem_call in enumerate(memory_calls):
                 memory_operations += 1
                 if memory_operations > self._max_memory_operations_per_turn:
-                    writer.emit(
-                        "memory_operation",
-                        {"operation": "budget_exhausted", "tool_name": mem_call.name},
-                        match_id=match_id,
-                        turn_index=turn_idx,
-                        actor_id=actor_id,
-                    )
+                    for rejected_call in memory_calls[memory_index:]:
+                        writer.emit(
+                            "memory_operation",
+                            {
+                                "operation": "budget_exhausted",
+                                "tool_name": rejected_call.name,
+                            },
+                            match_id=match_id,
+                            turn_index=turn_idx,
+                            actor_id=actor_id,
+                        )
+                        transcript.append(
+                            {
+                                "role": "tool",
+                                "content": json.dumps(
+                                    {"error": "Memory operation budget exceeded"}
+                                ),
+                                "tool_call_id": rejected_call.call_id,
+                            }
+                        )
                     return _TurnFailure(
                         "memory_budget_exhausted",
                         actor_id=actor_id,
@@ -1016,14 +1080,86 @@ class RunEngine:
                         actor_id=actor_id,
                     )
 
-                messages.append(
+                transcript.append(
                     {
                         "role": "tool",
                         "content": result_content,
                         "tool_call_id": mem_call.call_id,
                     }
                 )
-            request = request.model_copy(update={"messages": messages})
+            request = self._request_from_transcript(
+                actor_id,
+                system_prompt,
+                transcript,
+                all_tools,
+            )
+
+    async def _finalize_turn(
+        self,
+        writer: EventWriter,
+        request: AgentRequest,
+        match_id: str,
+        turn_idx: int,
+        actor_id: str,
+        metrics: dict[str, Any],
+        transcript: list[JsonObject],
+    ) -> _TurnFailure | None:
+        response_or_failure = await self._get_response(
+            writer,
+            request,
+            match_id,
+            turn_idx,
+            actor_id,
+            metrics,
+        )
+        if isinstance(response_or_failure, _ResponseFailure):
+            return _TurnFailure(
+                response_or_failure.reason,
+                actor_id=actor_id,
+                turn_index=turn_idx,
+            )
+
+        response = response_or_failure
+        if response.tool_calls:
+            self._emit_validation_failure(
+                writer,
+                match_id,
+                turn_idx,
+                actor_id,
+                response,
+                "finalization_tool_calls",
+            )
+            return _TurnFailure(
+                "finalization_tool_calls",
+                actor_id=actor_id,
+                turn_index=turn_idx,
+            )
+
+        if not response.assistant_text and not (
+            response.finish_reason and response.finish_reason.strip()
+        ):
+            self._emit_validation_failure(
+                writer,
+                match_id,
+                turn_idx,
+                actor_id,
+                response,
+                "finalization_empty_response",
+            )
+            return _TurnFailure(
+                "finalization_empty_response",
+                actor_id=actor_id,
+                turn_index=turn_idx,
+            )
+
+        if response.assistant_text:
+            transcript.append(
+                cast(
+                    JsonObject,
+                    {"role": "assistant", "content": response.assistant_text},
+                )
+            )
+        return None
 
     @staticmethod
     def _memory_context(session: GameSession, fallback_turn: int) -> tuple[int, int]:
@@ -1042,6 +1178,62 @@ class RunEngine:
             else fallback_turn
         )
         return hand_index, in_hand_turn
+
+    def _drain_match_memory_summaries(
+        self,
+        writer: EventWriter,
+        session: GameSession,
+        memory: MatchMemory,
+        match_id: str,
+        turn_idx: int | None,
+        actor_id: str | None,
+    ) -> None:
+        drain = getattr(session, "drain_match_memory_summaries", None)
+        if not callable(drain):
+            return
+        summaries_raw: object = drain()
+        if type(summaries_raw) is not list:
+            raise RunError("Plugin summary drain must return a list")
+        for summary_raw in cast(list[object], summaries_raw):
+            summary = MatchMemorySummary.model_validate(summary_raw)
+            memory.append_summary(summary)
+            writer.emit(
+                "memory_operation",
+                {
+                    "operation": "summary",
+                    "actor_id": summary.actor_id,
+                    "hand": summary.hand,
+                    "turn": summary.turn,
+                    "text": summary.text,
+                    "text_length": len(summary.text),
+                },
+                match_id=match_id,
+                turn_index=turn_idx,
+                actor_id=summary.actor_id,
+            )
+
+    @staticmethod
+    def _conversation_scope(session: GameSession, fallback_scope: str) -> str:
+        scope = getattr(session, "conversation_scope_id", None)
+        if scope is None:
+            return fallback_scope
+        if type(scope) is not str or not scope:
+            raise RunError("conversation_scope_id must be a non-empty string")
+        return scope
+
+    @staticmethod
+    def _request_from_transcript(
+        actor_id: str,
+        system_prompt: str,
+        transcript: list[JsonObject],
+        tools: list[Any],
+    ) -> AgentRequest:
+        return AgentRequest(
+            actor_id=actor_id,
+            system_prompt=system_prompt,
+            messages=copy.deepcopy(transcript),
+            tools=list(tools),
+        )
 
     async def _get_response(
         self,
@@ -1088,14 +1280,19 @@ class RunEngine:
             except ProviderError as exc:
                 metrics["provider_failures"] += 1
                 metrics["latency_seconds"] += time.monotonic() - started
+                provider_error_payload: dict[str, Any] = {
+                    "error": str(exc),
+                    "provider": exc.provider,
+                    "model": exc.model,
+                    "attempt": attempt + 1,
+                }
+                if exc.raw_provider_response is not None:
+                    provider_error_payload["raw_provider_response"] = (
+                        exc.raw_provider_response
+                    )
                 writer.emit(
                     "provider_error",
-                    {
-                        "error": str(exc),
-                        "provider": exc.provider,
-                        "model": exc.model,
-                        "attempt": attempt + 1,
-                    },
+                    cast(JsonObject, provider_error_payload),
                     match_id=match_id,
                     turn_index=turn_idx,
                     actor_id=actor_id,
@@ -1190,11 +1387,11 @@ class RunEngine:
         return self._agent
 
     def _exact_agent_mapping_error(self) -> str | None:
-        if not bool(getattr(self._game, "requires_exact_agent_ids", False)):
-            return None
-
-        resolver = getattr(self._game, "player_ids_from_config", None)
         try:
+            if not bool(getattr(self._game, "requires_exact_agent_ids", False)):
+                return None
+
+            resolver = getattr(self._game, "player_ids_from_config", None)
             if callable(resolver):
                 actor_ids_raw: object = cast(Callable[[JsonObject], object], resolver)(
                     copy.deepcopy(self._game_config)
@@ -1237,13 +1434,18 @@ class RunEngine:
 
     @staticmethod
     def _tool_call_payload(tool_call: ToolCall) -> JsonObject:
+        arguments = redact_value(tool_call.arguments)
+        raw_arguments = tool_call.raw_arguments
+        if raw_arguments is None:
+            raw_arguments = json.dumps(arguments or {})
+        raw_arguments = redact_json_text(raw_arguments)
         return cast(
             JsonObject,
             {
                 "call_id": tool_call.call_id,
                 "name": tool_call.name,
-                "arguments": tool_call.arguments,
-                "raw_arguments": tool_call.raw_arguments,
+                "arguments": arguments,
+                "raw_arguments": raw_arguments,
                 "parse_error": tool_call.parse_error,
             },
         )
@@ -1253,36 +1455,96 @@ class RunEngine:
         request: AgentRequest,
         response: ModelResponse,
         error: str,
+        transcript: list[JsonObject] | None = None,
+        *,
+        detail: str | None = None,
+        details: object | None = None,
     ) -> AgentRequest:
-        messages = list(request.messages)
+        validation_message = f"Validation error: {error}"
+        if detail:
+            validation_message += f": {redact_text(detail)}"
+        if details is not None:
+            try:
+                serialized_details = json.dumps(details, sort_keys=True)
+            except (TypeError, ValueError, OverflowError):
+                try:
+                    serialized_details = repr(details)
+                except Exception:
+                    serialized_details = "<unserializable details>"
+                serialized_details = redact_text(serialized_details)
+            else:
+                serialized_details = redact_json_text(serialized_details)
+            validation_message += f" Details: {serialized_details}"
+        validation_message += ". Please try again."
+        messages = [self._redact_retry_message(message) for message in request.messages]
         if response.tool_calls:
-            messages.append(self._assistant_tool_message(response))
+            messages.append(self._assistant_tool_message(response, redact=True))
             for tool_call in response.tool_calls:
                 messages.append(
                     {
                         "role": "tool",
-                        "content": f"Validation error: {error}. Please try again.",
+                        "content": validation_message,
                         "tool_call_id": tool_call.call_id,
                     }
                 )
         else:
-            messages.append({"role": "assistant", "content": response.assistant_text})
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": redact_json_text(response.assistant_text),
+                }
+            )
             messages.append(
                 {
                     "role": "user",
-                    "content": f"Validation error: {error}. Please try again.",
+                    "content": validation_message,
                 }
             )
+
+        if transcript is not None:
+            transcript.clear()
+            transcript.extend(copy.deepcopy(messages))
 
         return request.model_copy(update={"messages": messages})
 
     @staticmethod
-    def _assistant_tool_message(response: ModelResponse) -> JsonObject:
+    def _redact_retry_message(message: JsonObject) -> JsonObject:
+        """Redact model-visible content without changing protocol identifiers."""
+        redacted = copy.deepcopy(message)
+        if "content" in redacted:
+            content = redacted["content"]
+            redacted["content"] = (
+                redact_json_text(content)
+                if isinstance(content, str)
+                else redact_value(content)
+            )
+
+        tool_calls = redacted.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    function["arguments"] = redact_json_text(arguments)
+                elif isinstance(arguments, dict | list):
+                    function["arguments"] = redact_value(arguments)
+        return redacted
+
+    @staticmethod
+    def _assistant_tool_message(
+        response: ModelResponse, *, redact: bool = False
+    ) -> JsonObject:
         calls: list[JsonObject] = []
         for tool_call in response.tool_calls:
             raw_arguments = tool_call.raw_arguments
             if raw_arguments is None:
                 raw_arguments = json.dumps(tool_call.arguments or {})
+            if redact:
+                raw_arguments = redact_json_text(raw_arguments)
             calls.append(
                 {
                     "id": tool_call.call_id,
@@ -1297,7 +1559,11 @@ class RunEngine:
             JsonObject,
             {
                 "role": "assistant",
-                "content": response.assistant_text,
+                "content": (
+                    redact_json_text(response.assistant_text)
+                    if redact
+                    else response.assistant_text
+                ),
                 "tool_calls": calls,
             },
         )
@@ -1338,6 +1604,7 @@ class RunEngine:
         self,
         writer: EventWriter,
         session: GameSession,
+        memory: MatchMemory,
         match_id: str,
         metrics: dict[str, Any],
     ) -> _MatchOutcome:
@@ -1346,6 +1613,14 @@ class RunEngine:
             session,
             match_id,
             turn_index=None,
+            actor_id=getattr(session, "current_actor_id", None),
+        )
+        self._drain_match_memory_summaries(
+            writer,
+            session,
+            memory,
+            match_id,
+            turn_idx=None,
             actor_id=getattr(session, "current_actor_id", None),
         )
         try:
@@ -1391,24 +1666,13 @@ class RunEngine:
         if type(events_raw) is not list:
             raise RunError("Plugin event drain must return a list")
         for event_raw in cast(list[object], events_raw):
-            if type(event_raw) is not dict:
-                raise RunError("Plugin event must be a JSON object")
-            event = cast(dict[object, object], event_raw)
-            event_type_raw = event.get("event_type")
-            event_type = cast(object, event_type_raw)
-            if type(event_type) is not str or not event_type:
-                raise RunError("Plugin event must contain a non-empty event_type")
-            payload = cast(
-                JsonObject,
-                {
-                    key: cast(JsonObject, value)
-                    for key, value in event.items()
-                    if type(key) is str and key != "event_type"
-                },
-            )
+            try:
+                event = PluginEvent.model_validate(event_raw)
+            except ValidationError as exc:
+                raise RunError("Plugin event must match its typed contract") from exc
             writer.emit(
-                event_type,
-                payload,
+                event.event_type,
+                event.payload,
                 match_id=match_id,
                 turn_index=turn_index,
                 actor_id=actor_id,
@@ -1418,6 +1682,7 @@ class RunEngine:
         self,
         writer: EventWriter,
         session: GameSession,
+        memory: MatchMemory,
         match_id: str,
         metrics: dict[str, Any],
         failure: _TurnFailure,
@@ -1468,13 +1733,21 @@ class RunEngine:
                         turn_index=failure.turn_index,
                         actor_id=failure.actor_id,
                     )
+                    self._drain_match_memory_summaries(
+                        writer,
+                        session,
+                        memory,
+                        match_id,
+                        turn_idx=failure.turn_index,
+                        actor_id=failure.actor_id,
+                    )
                 if callable(handler):
                     try:
                         if session.is_terminal:
                             if recovery is not None:
                                 self._emit_failed_turn_end(writer, match_id, failure)
                                 return self._complete_match(
-                                    writer, session, match_id, metrics
+                                    writer, session, memory, match_id, metrics
                                 )
                     except Exception as exc:
                         writer.emit(

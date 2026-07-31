@@ -132,33 +132,73 @@ the environment variable name, never the literal API key.
 The run configuration also records `max_memory_operations_per_turn`, the
 finite budget reserved for engine-owned memory operations.
 
+### Conversations and Optional Session Capabilities
+
+The engine owns the transcript. Each actor has an isolated transcript for the
+current conversation scope. On every turn, the engine appends a fresh
+actor-specific observation as a user message. Assistant tool-call messages and
+matching tool-result messages remain in the transcript as valid Chat
+Completions history; the system prompt is kept separate.
+
+Sessions may optionally expose:
+
+```python
+from benchtable.contracts import MatchMemorySummary
+
+
+class MySession:
+    @property
+    def conversation_scope_id(self) -> str:
+        """Stable identifier for the current conversation scope."""
+
+    def drain_match_memory_summaries(self) -> list[MatchMemorySummary]:
+        """Return pending public summaries addressed to specific actors."""
+```
+
+When `conversation_scope_id` changes, the engine clears all actor transcripts
+before the next request. A session without this capability uses a stable
+match-scoped conversation for legacy compatibility. The summary drain is also
+optional. When present, the engine drains and stores summaries before the next
+actor request and before terminal match completion. A summary must identify
+its target actor and contain only compact public information, not raw state or
+private observations.
+
 ### Reserved Memory Tools
 
 The engine provides two reserved tools to every agent during a match:
 
-- `read_memory`: Returns the actor's private notes in chronological order.
+- `read_memory`: Returns that actor's private notes and actor-targeted system
+  summaries in chronological order. Each entry has a `source` marker of
+  `agent` or `system`.
 - `write_memory(text)`: Appends a free-form private note.
 
+System summaries are stored separately from agent notes and do not consume the
+configured agent-note entry or character limits.
+
 Memory-only calls do not advance the game turn. The engine processes them and
-requests another model response. A final response must contain exactly one game
-action. Writes may accompany that action and are committed atomically -- if the
-game action is invalid, the writes are discarded. `read_memory` cannot be
-combined with the final action.
+requests another model response. Memory writes are committed when their
+memory-only calls succeed and cannot be paired with a game action. A response
+that mixes memory and game calls is invalid and retried in the pre-action loop.
+The action-phase response must contain exactly one recognized game action.
+`read_memory` cannot be combined with that action.
 
 Memory state is per-match and per-actor. Notes are never shared between agents
 or across matches.
 
 When a response contains several memory-only calls, the engine processes them
-in response order and counts each call against the memory budget. Writes paired
-with one game action are validated as a batch before the action and committed
-only after the action succeeds.
+in response order and counts each call against the memory budget. Each
+assistant tool-call message and matching tool result is retained in the actor's
+transcript before the next request.
 
 ### Strict Observations
 
 The engine calls `get_observation(actor_id)` for the **current actor only**.
 Never include another player's private information in an observation. The
-engine passes only your observation, the system prompt, and the tools to the
-model.
+engine appends only that observation to the current actor's transcript and
+passes that transcript, the system prompt, and the applicable tools to the
+model. The current actor's accumulated transcript and memory results addressed
+to that actor are permitted. Never expose raw game state, another actor's
+observation, transcript, or memory.
 
 ### Tool Definitions
 
@@ -170,6 +210,13 @@ Return OpenAI-compatible function tools via `get_tools(actor_id)`. Use
 `apply_action` receives the actor ID, tool name, and parsed arguments. If the
 action is invalid, raise `InvalidActionError`. The engine will retry within the
 configured budget.
+
+After applying an accepted action, the engine appends the assistant tool-call
+message and a tool result containing only the public transition summary,
+metrics, and terminal status. It then makes exactly one tool-free finalization
+call. Finalization must contain assistant text or a finish reason. A
+finalization response containing any tool call fails immediately and is not
+retried.
 
 ### Failed Turns
 

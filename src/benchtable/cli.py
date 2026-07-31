@@ -13,11 +13,7 @@ import typer
 from benchtable.agents.protocol import Agent
 from benchtable.config import AgentConfig, load_config
 from benchtable.contracts import JsonObject
-from benchtable.errors import (
-    BenchtableError,
-    ConfigurationError,
-    PluginError,
-)
+from benchtable.events import redact_value
 from benchtable.games.registry import GameRegistry
 
 app = typer.Typer(
@@ -29,6 +25,11 @@ app = typer.Typer(
 _registry: GameRegistry | None = None
 AgentFactory = Callable[[AgentConfig], Agent]
 _agent_factory: AgentFactory | None = None
+
+
+def _safe_error_message(error: BaseException) -> str:
+    """Redact credential-shaped text before printing an error."""
+    return cast(str, redact_value(str(error)))
 
 
 def _get_registry() -> GameRegistry:
@@ -71,15 +72,19 @@ def list_games() -> None:
     """List installed game plugins and their versions."""
     try:
         registry = _get_registry()
-    except PluginError as exc:
-        typer.echo(f"Plugin discovery error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Plugin discovery error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
-    plugins = registry.list()
-    if not plugins:
-        typer.echo("No game plugins installed.")
-        return
-    for plugin in plugins:
-        typer.echo(f"{plugin.name}\t{plugin.version}")
+    try:
+        plugins = registry.list()
+        if not plugins:
+            typer.echo("No game plugins installed.")
+            return
+        for plugin in plugins:
+            typer.echo(f"{plugin.name}\t{plugin.version}")
+    except Exception as exc:
+        typer.echo(f"Plugin listing error: {_safe_error_message(exc)}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("run")
@@ -96,35 +101,39 @@ def run_experiment(
     """Validate configuration, execute matches, and write the trace."""
     try:
         cfg = load_config(config)
-    except ConfigurationError as exc:
-        typer.echo(f"Configuration error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Configuration error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
 
     try:
         registry = _get_registry()
-    except PluginError as exc:
-        typer.echo(f"Plugin discovery error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Plugin discovery error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
     try:
         game = registry.load(cfg.run.game)
-    except PluginError as exc:
-        typer.echo(f"Plugin error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Plugin error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
 
     # Validate game-specific configuration before constructing agents.
     try:
         registry.validate_plugin_config(cfg.run.game, cfg.run.game_config)
-    except (ValueError, PluginError) as exc:
-        typer.echo(f"Game configuration error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Game configuration error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
 
     try:
         actor_ids = set(registry.resolve_player_ids(cfg.run.game, cfg.run.game_config))
-    except (PluginError, ValueError) as exc:
-        typer.echo(f"Game configuration error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Game configuration error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
 
-    exact_mapping = registry.requires_exact_agent_ids(cfg.run.game)
+    try:
+        exact_mapping = registry.requires_exact_agent_ids(cfg.run.game)
+    except Exception as exc:
+        typer.echo(f"Plugin error: {_safe_error_message(exc)}", err=True)
+        raise typer.Exit(code=1) from exc
 
     if exact_mapping or len(cfg.agents) > 1:
         configured_ids = {agent_cfg.id for agent_cfg in cfg.agents}
@@ -150,39 +159,44 @@ def run_experiment(
     for agent_cfg in cfg.agents:
         try:
             agents[agent_cfg.id] = agent_factory(agent_cfg)
-        except ConfigurationError as exc:
-            typer.echo(f"Agent error: {exc}", err=True)
+        except Exception as exc:
+            typer.echo(f"Agent error: {_safe_error_message(exc)}", err=True)
             raise typer.Exit(code=1) from exc
         agent_metadata.append(cast(JsonObject, agent_cfg.model_dump(mode="json")))
 
-    output.mkdir(parents=True, exist_ok=True)
-
-    from benchtable.engine import RunEngine
-
-    engine = RunEngine(
-        game=game,
-        agent=next(iter(agents.values())) if len(agents) == 1 else None,
-        agents=agents if len(agents) > 1 else None,
-        agent_metadata=agent_metadata,
-        game_config=cfg.run.game_config,
-        run_dir=output,
-        run_id=f"run-{cfg.run.seed}-{uuid4().hex}",
-        seed=cfg.run.seed,
-        matches=cfg.run.matches,
-        max_turns=cfg.run.max_turns,
-        max_invalid_attempts=cfg.run.max_invalid_attempts,
-        max_provider_retries=cfg.run.max_provider_retries,
-        max_memory_operations_per_turn=cfg.run.max_memory_operations_per_turn,
-    )
-
     try:
+        output.mkdir(parents=True, exist_ok=True)
+
+        from benchtable.engine import RunEngine
+
+        engine = RunEngine(
+            game=game,
+            agent=next(iter(agents.values())) if len(agents) == 1 else None,
+            agents=agents if len(agents) > 1 else None,
+            agent_id=cfg.agents[0].id if len(agents) == 1 else None,
+            agent_metadata=agent_metadata,
+            game_config=cfg.run.game_config,
+            run_dir=output,
+            run_id=f"run-{cfg.run.seed}-{uuid4().hex}",
+            seed=cfg.run.seed,
+            matches=cfg.run.matches,
+            max_turns=cfg.run.max_turns,
+            max_invalid_attempts=cfg.run.max_invalid_attempts,
+            max_provider_retries=cfg.run.max_provider_retries,
+            max_memory_operations_per_turn=cfg.run.max_memory_operations_per_turn,
+        )
         result = asyncio.run(engine.run())
-    except BenchtableError as exc:
-        typer.echo(f"Run error: {exc}", err=True)
+    except Exception as exc:
+        typer.echo(f"Run error: {_safe_error_message(exc)}", err=True)
         raise typer.Exit(code=1) from exc
 
-    trace_path = output / "events.jsonl"
-    if not result.success:
+    try:
+        trace_path = output / "events.jsonl"
+        success = result.success
+    except Exception as exc:
+        typer.echo(f"Run error: {_safe_error_message(exc)}", err=True)
+        raise typer.Exit(code=1) from exc
+    if not success:
         typer.echo(f"Run failed; trace written to {trace_path}", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"Trace written to {trace_path}")

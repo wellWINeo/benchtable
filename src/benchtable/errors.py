@@ -42,10 +42,12 @@ class ProviderError(BenchtableError):
         *,
         provider: str | None = None,
         model: str | None = None,
+        raw_provider_response: Any | None = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.model = model
+        self.raw_provider_response = raw_provider_response
 
 
 class RunError(BenchtableError):

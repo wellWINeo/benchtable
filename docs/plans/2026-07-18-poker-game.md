@@ -1,5 +1,12 @@
 # Poker Game Implementation Plan
 
+> **Historical / superseded by the 2026-07-26 hand-session design. Do not execute
+> this historical plan.** It is retained as historical task context only. Current
+> semantics are that memory calls occur in separate model responses before the
+> game-action response, mixed memory/action responses are rejected, and memory
+> writes are memory-only and committed immediately. The paired, batched, and
+> accompanying-write instructions below are obsolete.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add a first-party configurable no-limit Texas Hold'em plugin with repeated hands, private per-agent memory, and complete offline traces.

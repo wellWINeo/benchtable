@@ -47,6 +47,7 @@ def _make_response(
     choices: list[dict[str, Any]],
     *,
     usage: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> Any:
     """Return a mock that behaves like an OpenAI ChatCompletion."""
     data: dict[str, Any] = {
@@ -58,6 +59,8 @@ def _make_response(
     }
     if usage is not None:
         data["usage"] = usage
+    if extra is not None:
+        data.update(extra)
 
     class _FakeCompletion:
         def __init__(self, d: dict[str, Any]) -> None:
@@ -404,6 +407,79 @@ class TestOpenAICompatibleAgent:
         assert resp.tool_calls[0].raw_arguments == "not-json"
         assert resp.tool_calls[0].parse_error is not None
 
+    def test_duplicate_provider_tool_call_ids_are_provider_errors(self) -> None:
+        provider_response = _make_response(
+            [
+                _make_choice(
+                    tool_calls=[
+                        {
+                            "id": "duplicate",
+                            "type": "function",
+                            "function": {"name": "act", "arguments": "{}"},
+                        },
+                        {
+                            "id": "duplicate",
+                            "type": "function",
+                            "function": {"name": "act", "arguments": "{}"},
+                        },
+                    ]
+                )
+            ],
+            extra={"api_secret": "adapter-secret"},
+        )
+
+        async def fake_create(**kwargs: Any) -> Any:
+            return provider_response
+
+        agent = OpenAICompatibleAgent(
+            model="gpt-4o",
+            api_key_env="TEST_API_KEY",
+            _client_factory=lambda **kw: _FakeClient(fake_create, kw),
+        )
+
+        with pytest.raises(ProviderError, match="duplicate call_id") as exc_info:
+            asyncio.run(agent.respond(_make_request()))
+
+        assert exc_info.value.provider == "openai"
+        assert exc_info.value.model == "gpt-4o"
+        assert exc_info.value.raw_provider_response == provider_response.model_dump(
+            mode="json"
+        )
+
+    def test_invalid_provider_tool_call_id_is_a_provider_error_with_raw_response(
+        self,
+    ) -> None:
+        provider_response = _make_response(
+            [
+                _make_choice(
+                    tool_calls=[
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "act", "arguments": "{}"},
+                        }
+                    ]
+                )
+            ],
+            extra={"session_token": "adapter-session-secret"},
+        )
+
+        async def fake_create(**kwargs: Any) -> Any:
+            return provider_response
+
+        agent = OpenAICompatibleAgent(
+            model="gpt-4o",
+            api_key_env="TEST_API_KEY",
+            _client_factory=lambda **kw: _FakeClient(fake_create, kw),
+        )
+
+        with pytest.raises(ProviderError, match="call_id") as exc_info:
+            asyncio.run(agent.respond(_make_request()))
+
+        assert exc_info.value.raw_provider_response == provider_response.model_dump(
+            mode="json"
+        )
+
     @pytest.mark.parametrize("raw_arguments", ["null", "[]", "1", '"text"'])
     def test_non_object_tool_arguments_preserve_raw_text(
         self, raw_arguments: str
@@ -512,8 +588,12 @@ class TestOpenAICompatibleAgent:
         assert "sk-test123" not in str(exc_info.value)
 
     def test_empty_provider_choices_are_wrapped(self) -> None:
+        provider_response = _make_response(
+            [], extra={"client_token": "adapter-client-secret"}
+        )
+
         async def fake_create(**kwargs: Any) -> Any:
-            return _make_response([])
+            return provider_response
 
         agent = OpenAICompatibleAgent(
             model="gpt-4o",
@@ -521,8 +601,12 @@ class TestOpenAICompatibleAgent:
             _client_factory=lambda **kw: _FakeClient(fake_create, kw),
         )
 
-        with pytest.raises(ProviderError):
+        with pytest.raises(ProviderError) as exc_info:
             asyncio.run(agent.respond(_make_request()))
+
+        assert exc_info.value.raw_provider_response == provider_response.model_dump(
+            mode="json"
+        )
 
     def test_api_key_not_in_error_message(
         self, monkeypatch: pytest.MonkeyPatch

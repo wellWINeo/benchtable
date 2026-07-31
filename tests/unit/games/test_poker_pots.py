@@ -88,6 +88,21 @@ class TestBuildPots:
         assert sum(p.amount for p in pots) == 100
         assert pots[0].returned == {"a": 50}
 
+    def test_folded_dead_money_prevents_return_and_forms_side_pot(self) -> None:
+        contributions = {
+            "a": PotContribution(player="a", amount=100),
+            "b": PotContribution(player="b", amount=50),
+            "c": PotContribution(player="c", amount=100, folded=True),
+        }
+
+        pots = build_pots(contributions)
+
+        assert [(pot.amount, pot.eligible) for pot in pots] == [
+            (150, ["a", "b"]),
+            (100, ["a"]),
+        ]
+        assert all(not pot.returned for pot in pots)
+
     def test_all_in_creates_side_pot(self) -> None:
         contributions = {
             "a": PotContribution(player="a", amount=50, all_in_at=50),

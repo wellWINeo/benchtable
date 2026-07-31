@@ -78,6 +78,10 @@ class GameRegistry:
             return bool(getattr(plugin, "requires_exact_agent_ids"))
         except AttributeError:
             return False
+        except Exception as exc:
+            raise PluginError(
+                f"Plugin '{name}' exact-agent capability could not be read: {exc}"
+            ) from exc
 
     def discover(self) -> None:
         """Discover plugins from the benchtable.games entry-point group."""
@@ -146,8 +150,12 @@ def _validated_plugin_name(plugin: GamePlugin) -> str:
     for attribute in ("player_ids_from_config", "validate_config"):
         try:
             value = getattr(plugin, attribute)
-        except Exception:
+        except AttributeError:
             continue
+        except Exception as exc:
+            raise PluginError(
+                f"Plugin optional attribute '{attribute}' could not be read"
+            ) from exc
         if not callable(value):
             raise PluginError(f"Plugin attribute '{attribute}' must be callable")
 

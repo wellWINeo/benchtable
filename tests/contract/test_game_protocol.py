@@ -5,12 +5,17 @@ import pytest
 from benchtable.contracts import (
     GameResult,
     JsonObject,
+    MatchMemorySummary,
     Observation,
     ToolSpec,
     Transition,
 )
 from benchtable.errors import InvalidActionError
-from benchtable.games.protocol import GameSession
+from benchtable.games.protocol import (
+    ConversationScopedSession,
+    GameSession,
+    MatchMemorySummarySession,
+)
 
 
 class TestGameProtocol:
@@ -52,6 +57,46 @@ class TestGameProtocol:
         session = game.create_session(seed=42, game_config={})
 
         assert session.current_actor_id in ("a", "b")
+
+    def test_optional_conversation_scope_capability_is_discoverable(self) -> None:
+        class ScopedSession:
+            current_actor_id = "a"
+
+            @property
+            def conversation_scope_id(self) -> str:
+                return "hand-1"
+
+        assert isinstance(ScopedSession(), ConversationScopedSession)
+
+    def test_optional_memory_summary_capability_is_discoverable(self) -> None:
+        class SummarySession:
+            current_actor_id = "a"
+
+            def drain_match_memory_summaries(self) -> list[MatchMemorySummary]:
+                return []
+
+        assert isinstance(SummarySession(), MatchMemorySummarySession)
+
+    def test_legacy_session_without_optional_caps_remains_valid(self) -> None:
+        class LegacySession:
+            current_actor_id = "a"
+            is_terminal = False
+
+            def get_observation(self, actor_id: str) -> Observation:
+                return Observation(actor_id=actor_id, text="Legacy.")
+
+            def get_tools(self, actor_id: str) -> list[ToolSpec]:
+                return []
+
+            def apply_action(
+                self, actor_id: str, tool_name: str, arguments: JsonObject
+            ) -> Transition:
+                return Transition(summary="legacy")
+
+            def get_result(self) -> GameResult:
+                return GameResult(completed=False)
+
+        assert isinstance(LegacySession(), GameSession)
 
     def test_returns_observation_for_current_actor(self) -> None:
         from tests.fixtures.tiny_game import TinyGame
