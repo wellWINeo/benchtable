@@ -205,6 +205,16 @@ class TestModelResponse:
         assert resp.usage is not None
         assert resp.usage.prompt_tokens == 100
 
+    def test_preserves_raw_provider_request(self) -> None:
+        request = {"provider": "fake", "request": {"model": "test"}}
+        response = ModelResponse(
+            assistant_text="",
+            tool_calls=[],
+            raw_provider_request=request,
+        )
+
+        assert response.raw_provider_request == request
+
 
 class TestGameResult:
     def test_completion_with_outcome(self) -> None:

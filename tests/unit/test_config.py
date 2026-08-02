@@ -13,6 +13,77 @@ from benchtable.errors import ConfigurationError
 
 
 class TestLoadConfig:
+    @pytest.mark.parametrize(
+        ("provider", "fields", "expected"),
+        [
+            ("openai_compatible", {}, {"api_key_env": "OPENAI_API_KEY"}),
+            (
+                "gigachat",
+                {"credential_env": "GIGA_ENV", "scope": "GIGACHAT_API_PERS"},
+                {"credential_env": "GIGA_ENV", "scope": "GIGACHAT_API_PERS"},
+            ),
+            (
+                "yandex_ai_studio",
+                {"credential_env": "YC_ENV", "folder_id": "folder-123"},
+                {
+                    "credential_env": "YC_ENV",
+                    "folder_id": "folder-123",
+                    "credential_kind": "oauth",
+                },
+            ),
+        ],
+    )
+    def test_provider_configuration_defaults(
+        self,
+        tmp_path: Path,
+        provider: str,
+        fields: dict[str, str],
+        expected: dict[str, str],
+    ) -> None:
+        lines = [f'provider = "{provider}"', 'model = "provider-model"']
+        lines.extend(f'{key} = "{value}"' for key, value in fields.items())
+        cfg_path = tmp_path / "provider.toml"
+        cfg_path.write_text(
+            '[run]\ngame = "tiny"\nmatches = 1\n\n[[agents]]\nid = "a"\n'
+            + "\n".join(lines)
+            + "\n"
+        )
+
+        agent = load_config(cfg_path).agents[0]
+
+        assert agent.provider == provider
+        for field, value in expected.items():
+            assert getattr(agent, field) == value
+
+    @pytest.mark.parametrize(
+        "agent_fields",
+        [
+            'provider = "gigachat"\nmodel = "provider-model"',
+            'provider = "yandex_ai_studio"\nmodel = "provider-model"\n'
+            'credential_env = "YC_ENV"',
+            'provider = "yandex_ai_studio"\nmodel = "provider-model"\n'
+            'folder_id = "folder"\ncredential_kind = "iam"\n'
+            'credential_env = "YC_ENV"',
+            'provider = "gigachat"\nmodel = "provider-model"\n'
+            'credential_env = "GIGA_ENV"\nscope = "S"\n'
+            'api_key_env = "OPENAI_API_KEY"',
+            'provider = "openai_compatible"\nmodel = "provider-model"\n'
+            'credential_env = "GIGA_ENV"',
+        ],
+    )
+    def test_rejects_invalid_provider_field_combinations(
+        self, tmp_path: Path, agent_fields: str
+    ) -> None:
+        cfg_path = tmp_path / "invalid-provider.toml"
+        cfg_path.write_text(
+            '[run]\ngame = "tiny"\nmatches = 1\n\n[[agents]]\nid = "a"\n'
+            + agent_fields
+            + "\n"
+        )
+
+        with pytest.raises(ConfigurationError):
+            load_config(cfg_path)
+
     def test_valid_toml_parses(self, tmp_path: Path) -> None:
         cfg_path = tmp_path / "test.toml"
         cfg_path.write_text(
@@ -57,6 +128,28 @@ class TestLoadConfig:
         )
         cfg = load_config(cfg_path)
         assert cfg.agents[0].api_key_env == "OPENAI_API_KEY"
+
+    def test_gigachat_scope_defaults_to_personal_api_scope(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "gigachat.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "player-1"
+            provider = "gigachat"
+            model = "GigaChat-3-Ultra"
+            credential_env = "GIGA_ENV"
+        """)
+        )
+
+        cfg = load_config(cfg_path)
+
+        assert cfg.agents[0].scope == "GIGACHAT_API_PERS"
 
     def test_optional_base_url(self, tmp_path: Path) -> None:
         cfg_path = tmp_path / "test.toml"

@@ -1290,6 +1290,10 @@ class RunEngine:
                     provider_error_payload["raw_provider_response"] = (
                         exc.raw_provider_response
                     )
+                if exc.raw_provider_request is not None:
+                    provider_error_payload["raw_provider_request"] = (
+                        exc.raw_provider_request
+                    )
                 writer.emit(
                     "provider_error",
                     cast(JsonObject, provider_error_payload),
@@ -1364,6 +1368,7 @@ class RunEngine:
                             if response.usage
                             else None
                         ),
+                        "raw_provider_request": response.raw_provider_request,
                         "latency_seconds": latency,
                         "raw_provider_response": response.raw_provider_response,
                     },

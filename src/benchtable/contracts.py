@@ -133,6 +133,7 @@ class ModelResponse(BaseModel):
     tool_calls: list[ToolCall]
     finish_reason: str | None = None
     usage: Usage | None = None
+    raw_provider_request: JsonObject | None = None
     raw_provider_response: JsonObject | None = None
 
     @model_validator(mode="after")

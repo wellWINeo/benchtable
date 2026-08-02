@@ -7,7 +7,7 @@ import math
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -17,6 +17,7 @@ from pydantic import (
     StrictStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from benchtable.contracts import JsonObject
@@ -85,6 +86,10 @@ def _is_strict_json_value(value: object) -> bool:
     return False
 
 
+ProviderName = Literal["openai_compatible", "gigachat", "yandex_ai_studio"]
+YandexCredentialKind = Literal["oauth", "api_key"]
+
+
 class AgentConfig(BaseModel):
     """Configuration for a single agent."""
 
@@ -93,8 +98,13 @@ class AgentConfig(BaseModel):
     id: StrictStr = Field(min_length=1)
     role: str = "player"
     model: StrictStr = Field(min_length=1)
+    provider: ProviderName = "openai_compatible"
     base_url: StrictStr | None = Field(default=None, min_length=1)
-    api_key_env: StrictStr = "OPENAI_API_KEY"
+    api_key_env: StrictStr | None = Field(default=None, min_length=1)
+    credential_env: StrictStr | None = Field(default=None, min_length=1)
+    scope: StrictStr | None = Field(default=None, min_length=1)
+    folder_id: StrictStr | None = Field(default=None, min_length=1)
+    credential_kind: YandexCredentialKind | None = None
     timeout: float | None = Field(default=None, gt=0)
     max_completion_tokens: StrictInt | None = Field(default=None, ge=1)
 
@@ -118,12 +128,52 @@ class AgentConfig(BaseModel):
             raise ValueError("Timeout must be a finite positive number")
         return numeric_value
 
-    @field_validator("id", "model", "base_url", "api_key_env")
+    @field_validator(
+        "id",
+        "model",
+        "base_url",
+        "api_key_env",
+        "credential_env",
+        "scope",
+        "folder_id",
+    )
     @classmethod
     def reject_whitespace_only_strings(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("Provider strings must not be whitespace-only")
         return value
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self) -> AgentConfig:
+        fields = self.model_fields_set
+
+        def reject(names: set[str]) -> None:
+            invalid = sorted(names & fields)
+            if invalid:
+                raise ValueError("provider configuration contains unsupported fields")
+
+        if self.provider == "openai_compatible":
+            reject({"credential_env", "scope", "folder_id", "credential_kind"})
+            if self.api_key_env is None:
+                self.api_key_env = "OPENAI_API_KEY"
+            return self
+
+        if self.provider == "gigachat":
+            reject({"base_url", "api_key_env", "folder_id", "credential_kind"})
+            if self.credential_env is None:
+                raise ValueError("GigaChat requires provider credentials")
+            if self.scope is None:
+                self.scope = "GIGACHAT_API_PERS"
+            return self
+
+        reject({"base_url", "api_key_env", "scope"})
+        if self.credential_env is None or self.folder_id is None:
+            raise ValueError(
+                "Yandex AI Studio requires provider credentials and folder"
+            )
+        if self.credential_kind is None:
+            self.credential_kind = "oauth"
+        return self
 
 
 class RunConfig(BaseModel):

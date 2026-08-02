@@ -65,23 +65,29 @@ values are rejected rather than coerced. The top level accepts only `run` and
 ## `[[agents]]` Entries
 
 Provide at least one `[[agents]]` table. Unknown agent keys are rejected. `id`,
-`model`, `base_url` when present, and `api_key_env` must not be empty or
-whitespace-only. Every agent ID must be unique.
+`model`, and provider credential fields must not be empty or whitespace-only.
+Every agent ID must be unique.
 
 | Key | Type, default, and constraints | Effect |
 | --- | --- | --- |
 | `id` | Required strict nonblank string. | Identifies this configured agent. With multiple agents, it maps directly to a game actor ID. |
 | `role` | String; default `"player"`; no nonblank constraint. | Metadata recorded in the trace. It does not control turn assignment or game behavior. |
 | `model` | Required strict nonblank string. | Model value sent to the OpenAI-compatible Chat Completions endpoint. |
-| `base_url` | Optional strict nonblank string; default omitted (`None`). | Overrides the OpenAI-compatible endpoint for this agent. If omitted, the SDK default endpoint is used. |
-| `api_key_env` | Strict nonblank string; default `"OPENAI_API_KEY"`. | Names the environment variable from which the adapter reads this agent's credential. The name, not its value, is recorded. |
+| `provider` | One of `"openai_compatible"`, `"gigachat"`, or `"yandex_ai_studio"`; default `"openai_compatible"`. | Selects the provider adapter. Omitting it preserves existing OpenAI-compatible configurations. |
+| `base_url` | OpenAI-compatible only; optional strict nonblank string. | Overrides the OpenAI-compatible endpoint. |
+| `api_key_env` | OpenAI-compatible only; default `"OPENAI_API_KEY"`. | Names the environment variable containing the credential. |
+| `credential_env` | Required for GigaChat and Yandex; strict nonblank string. | Names the environment variable containing the provider credential. |
+| `scope` | GigaChat only; strict nonblank string; default `"GIGACHAT_API_PERS"`. | Selects the GigaChat API scope. |
+| `folder_id` | Yandex only; required strict nonblank string. | Selects the Yandex Cloud folder billed for inference. |
+| `credential_kind` | Yandex only; `"oauth"` or `"api_key"`, default `"oauth"`. | Documents the credential type while the SDK receives the unmodified value and handles OAuth renewal. |
 | `timeout` | Optional finite positive number; default omitted (`None`). Integers and floats are accepted. | Passed as the provider request timeout. |
 | `max_completion_tokens` | Optional strict integer, at least `1`; default omitted (`None`). | When supplied, is sent as `max_completion_tokens` on provider requests. |
 
-The adapter reads `api_key_env` when it is constructed. The named variable
-must exist and contain a non-whitespace value or `benchtable run` exits before
-making a provider request. Configure the environment in the shell that runs
-the command, for example:
+The selected adapter reads its configured environment variable when it is
+constructed. The named variable must exist and contain a non-whitespace value
+or `benchtable run` exits before making a provider request. Never place a
+credential value in TOML. Configure the environment in the shell that runs the
+command, for example:
 
 ```bash
 export OPENAI_API_KEY='...'
@@ -93,8 +99,8 @@ recursively anywhere in the file, including nested game configuration. This
 includes normalized variants of names such as `api_key`, `authorization`,
 `access_token`, `password`, `client_secret`, and `token`.
 
-Retries belong to the engine, not the SDK client: the OpenAI-compatible client
-is configured with SDK retries disabled so each engine attempt can be traced.
+Retries belong to the engine, not the SDK clients: OpenAI-compatible and
+GigaChat clients disable SDK retries so each engine attempt can be traced.
 There are no other generic generation settings. In particular, `max_tokens`,
 temperature, top-p, and provider-specific settings are not accepted generic
 agent keys; use only `max_completion_tokens` where supported by this schema.
@@ -113,6 +119,48 @@ When more than one `[[agents]]` entry is configured, or when a plugin declares
 resolved actor IDs, with no missing or extra IDs; each turn is dispatched to
 the matching actor ID. Otherwise, one configured agent is the shared fallback
 for every actor and its ID need not match an actor ID.
+
+## Provider Examples
+
+OpenAI-compatible remains the default when `provider` is omitted:
+
+```toml
+[[agents]]
+id = "player-1"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+```
+
+GigaChat uses its long-lived authorization credential. The SDK exchanges it
+for access tokens and renews them as needed; TLS verification remains enabled
+and SDK retries are disabled. Its scope defaults to `GIGACHAT_API_PERS` when
+omitted.
+
+```toml
+[[agents]]
+id = "player-1"
+provider = "gigachat"
+model = "GigaChat-3-Ultra"
+credential_env = "GIGACHAT_AUTHORIZATION_KEY"
+scope = "GIGACHAT_API_PERS"
+```
+
+Yandex AI Studio requires a folder ID. OAuth credentials can be refreshed by
+the SDK; an API key can be selected with `credential_kind = "api_key"`.
+Direct IAM-token configuration is rejected by the typed configuration.
+
+```toml
+[[agents]]
+id = "player-1"
+provider = "yandex_ai_studio"
+model = "aliceai-llm"
+folder_id = "folder-123"
+credential_kind = "oauth"
+credential_env = "YC_OAUTH_TOKEN"
+```
+
+Model availability is controlled by the provider account. No credential value,
+OAuth token-exchange payload, or direct IAM token belongs in TOML or traces.
 
 ## Poker `[run.game_config]`
 

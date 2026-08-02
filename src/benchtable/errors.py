@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from benchtable.contracts import JsonObject
+
 
 class BenchtableError(Exception):
     """Base error for all benchtable domain errors."""
@@ -42,11 +44,13 @@ class ProviderError(BenchtableError):
         *,
         provider: str | None = None,
         model: str | None = None,
+        raw_provider_request: JsonObject | None = None,
         raw_provider_response: Any | None = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.model = model
+        self.raw_provider_request = raw_provider_request
         self.raw_provider_response = raw_provider_response
 
 

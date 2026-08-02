@@ -9,6 +9,7 @@ from typing import Any
 from tests.fixtures.fake_agent import FakeAgent
 from tests.fixtures.tiny_game import TinyGame
 
+from benchtable.agents.gigachat import GigaChatAgent
 from benchtable.engine import RunEngine
 
 
@@ -124,3 +125,59 @@ class TestEngineTrace:
                 assert "secret_b" not in obs_text
             else:
                 assert "secret_a" not in obs_text
+
+    async def test_gigachat_provider_error_trace_omits_continuation_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        class _Client:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            async def achat(self, request: dict[str, Any]) -> dict[str, Any]:
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "function_call": {
+                                        "name": "act",
+                                        "arguments": {},
+                                    },
+                                    "functions_state_id": "state-1",
+                                    "reasoning_content": "hidden reasoning",
+                                },
+                                "finish_reason": "function_call",
+                            }
+                        ]
+                    }
+                raise RuntimeError("offline provider failure")
+
+        monkeypatch.setenv("GIGA_ENV", "configured-value")
+        client = _Client()
+        agent = GigaChatAgent(
+            model="GigaChat-3-Ultra",
+            credential_env="GIGA_ENV",
+            scope="GIGACHAT_API_PERS",
+            _client_factory=lambda **kwargs: client,
+        )
+        engine = RunEngine(
+            game=TinyGame(max_actions=1),
+            agent=agent,
+            run_dir=tmp_path / "run",
+            run_id="gigachat-provider-error",
+            max_provider_retries=0,
+        )
+
+        result = await engine.run()
+
+        assert not result.success
+        assert client.requests[1]["messages"][2]["functions_state_id"] == "state-1"
+        events = _read_events(tmp_path / "run")
+        provider_error = next(
+            event for event in events if event["event_type"] == "provider_error"
+        )
+        serialized_trace = json.dumps(provider_error["payload"])
+        assert "functions_state_id" not in serialized_trace
+        assert "reasoning_content" not in serialized_trace

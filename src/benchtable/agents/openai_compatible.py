@@ -124,13 +124,16 @@ class OpenAICompatibleAgent:
             client = self._get_client()
             response = await client.chat.completions.create(**request_kwargs)
         except Exception as exc:
-            raise self._provider_error(exc) from exc
+            raise self._provider_error(
+                exc, raw_provider_request=request_kwargs
+            ) from exc
 
         try:
-            return self._normalize_response(response)
+            return self._normalize_response(response, request_kwargs)
         except Exception as exc:
             raise self._provider_error(
                 exc,
+                raw_provider_request=request_kwargs,
                 raw_provider_response=self._raw_provider_response(response),
             ) from exc
 
@@ -138,6 +141,7 @@ class OpenAICompatibleAgent:
         self,
         exc: Exception,
         *,
+        raw_provider_request: JsonObject | None = None,
         raw_provider_response: Any | None = None,
     ) -> ProviderError:
         message = str(exc)
@@ -148,6 +152,7 @@ class OpenAICompatibleAgent:
             message,
             provider="openai",
             model=self._model,
+            raw_provider_request=raw_provider_request,
             raw_provider_response=raw_provider_response,
         )
 
@@ -161,7 +166,9 @@ class OpenAICompatibleAgent:
         except Exception:
             return None
 
-    def _normalize_response(self, response: Any) -> ModelResponse:
+    def _normalize_response(
+        self, response: Any, request_kwargs: dict[str, Any]
+    ) -> ModelResponse:
         choice = response.choices[0]
         message = choice.message
 
@@ -215,5 +222,6 @@ class OpenAICompatibleAgent:
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason,
             usage=usage,
+            raw_provider_request=cast(JsonObject, request_kwargs),
             raw_provider_response=raw,
         )

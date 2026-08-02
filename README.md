@@ -72,6 +72,7 @@ Only the API-key environment variable name is configured and recorded. Literal
 credentials are not accepted or written to traces.
 
 See the [complete configuration reference](docs/configuration.md) for all settings and constraints.
+Provider-specific examples and credential handling are documented in that reference.
 
 ## Plugins
 

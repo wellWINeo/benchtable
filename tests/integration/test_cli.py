@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from benchtable import cli
 from benchtable.cli import app
+from benchtable.config import AgentConfig
 from benchtable.errors import PluginError, ProviderError
 
 runner = CliRunner()
@@ -159,6 +160,75 @@ class TestListGames:
 
 
 class TestRunCommand:
+    def test_default_agent_factory_dispatches_gigachat_adapter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from benchtable.agents import gigachat
+
+        captured_kwargs: dict[str, Any] = {}
+
+        class _GigaChatAgent:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(gigachat, "GigaChatAgent", _GigaChatAgent)
+        config = AgentConfig(
+            id="a",
+            provider="gigachat",
+            model="GigaChat-3-Ultra",
+            credential_env="GIGA_ENV",
+            timeout=30.0,
+            max_completion_tokens=128,
+        )
+
+        agent = cli._default_agent_factory(config)
+
+        assert isinstance(agent, _GigaChatAgent)
+        assert captured_kwargs == {
+            "model": "GigaChat-3-Ultra",
+            "credential_env": "GIGA_ENV",
+            "scope": "GIGACHAT_API_PERS",
+            "timeout": 30.0,
+            "max_completion_tokens": 128,
+        }
+
+    def test_default_agent_factory_dispatches_yandex_adapter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from benchtable.agents import yandex_ai_studio
+
+        captured_kwargs: dict[str, Any] = {}
+
+        class _YandexAIStudioAgent:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(
+            yandex_ai_studio, "YandexAIStudioAgent", _YandexAIStudioAgent
+        )
+        config = AgentConfig(
+            id="a",
+            provider="yandex_ai_studio",
+            model="aliceai-llm",
+            credential_env="YC_ENV",
+            folder_id="folder-123",
+            credential_kind="api_key",
+            timeout=30.0,
+            max_completion_tokens=128,
+        )
+
+        agent = cli._default_agent_factory(config)
+
+        assert isinstance(agent, _YandexAIStudioAgent)
+        assert captured_kwargs == {
+            "model": "aliceai-llm",
+            "folder_id": "folder-123",
+            "credential_kind": "api_key",
+            "credential_env": "YC_ENV",
+            "timeout": 30.0,
+            "max_completion_tokens": 128,
+        }
+
     def test_single_agent_passes_id_for_exact_mapping_game(
         self, tmp_path: Path
     ) -> None:
@@ -440,8 +510,13 @@ class TestRunCommand:
                 "id": "a",
                 "role": "player",
                 "model": "gpt-4o",
+                "provider": "openai_compatible",
                 "base_url": None,
                 "api_key_env": "TEST_API_KEY",
+                "credential_env": None,
+                "scope": None,
+                "folder_id": None,
+                "credential_kind": None,
                 "timeout": None,
                 "max_completion_tokens": 128,
             }
@@ -521,8 +596,13 @@ class TestRunCommand:
                 "id": "a",
                 "role": "first",
                 "model": "fake-a",
+                "provider": "openai_compatible",
                 "base_url": None,
                 "api_key_env": "FAKE_A_KEY",
+                "credential_env": None,
+                "scope": None,
+                "folder_id": None,
+                "credential_kind": None,
                 "timeout": 1.5,
                 "max_completion_tokens": 64,
             },
@@ -530,8 +610,13 @@ class TestRunCommand:
                 "id": "b",
                 "role": "second",
                 "model": "fake-b",
+                "provider": "openai_compatible",
                 "base_url": "https://fake.example/v1",
                 "api_key_env": "FAKE_B_KEY",
+                "credential_env": None,
+                "scope": None,
+                "folder_id": None,
+                "credential_kind": None,
                 "timeout": 2.0,
                 "max_completion_tokens": 32,
             },

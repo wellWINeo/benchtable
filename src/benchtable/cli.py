@@ -56,15 +56,50 @@ def set_agent_factory(factory: AgentFactory | None) -> None:
 
 
 def _default_agent_factory(agent_config: AgentConfig) -> Agent:
-    from benchtable.agents.openai_compatible import OpenAICompatibleAgent
+    match agent_config.provider:
+        case "openai_compatible":
+            from benchtable.agents.openai_compatible import OpenAICompatibleAgent
 
-    return OpenAICompatibleAgent(
-        model=agent_config.model,
-        api_key_env=agent_config.api_key_env,
-        base_url=agent_config.base_url,
-        timeout=agent_config.timeout,
-        max_completion_tokens=agent_config.max_completion_tokens,
-    )
+            api_key_env = agent_config.api_key_env
+            if api_key_env is None:
+                raise AssertionError("validated OpenAI configuration lacks api_key_env")
+            return OpenAICompatibleAgent(
+                model=agent_config.model,
+                api_key_env=api_key_env,
+                base_url=agent_config.base_url,
+                timeout=agent_config.timeout,
+                max_completion_tokens=agent_config.max_completion_tokens,
+            )
+        case "gigachat":
+            from benchtable.agents.gigachat import GigaChatAgent
+
+            credential_env = agent_config.credential_env
+            scope = agent_config.scope
+            if credential_env is None or scope is None:
+                raise AssertionError("validated GigaChat configuration is incomplete")
+            return GigaChatAgent(
+                model=agent_config.model,
+                credential_env=credential_env,
+                scope=scope,
+                timeout=agent_config.timeout,
+                max_completion_tokens=agent_config.max_completion_tokens,
+            )
+        case "yandex_ai_studio":
+            from benchtable.agents.yandex_ai_studio import YandexAIStudioAgent
+
+            credential_env = agent_config.credential_env
+            folder_id = agent_config.folder_id
+            credential_kind = agent_config.credential_kind
+            if credential_env is None or folder_id is None or credential_kind is None:
+                raise AssertionError("validated Yandex configuration is incomplete")
+            return YandexAIStudioAgent(
+                model=agent_config.model,
+                folder_id=folder_id,
+                credential_kind=credential_kind,
+                credential_env=credential_env,
+                timeout=agent_config.timeout,
+                max_completion_tokens=agent_config.max_completion_tokens,
+            )
 
 
 @app.command("list-games")
