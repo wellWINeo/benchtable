@@ -71,6 +71,8 @@ api_key_env = "OPENAI_API_KEY"
 Only the API-key environment variable name is configured and recorded. Literal
 credentials are not accepted or written to traces.
 
+See the [complete configuration reference](docs/configuration.md) for all settings and constraints.
+
 ## Plugins
 
 Game plugins register via the `benchtable.games` entry-point group. See [docs/plugin-authoring.md](docs/plugin-authoring.md) for details.
