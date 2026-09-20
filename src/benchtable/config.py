@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     ValidationError,
@@ -107,6 +108,7 @@ class AgentConfig(BaseModel):
     credential_kind: YandexCredentialKind | None = None
     timeout: float | None = Field(default=None, gt=0)
     max_completion_tokens: StrictInt | None = Field(default=None, ge=1)
+    verify_ssl_certs: StrictBool = True
 
     @field_validator("timeout", mode="before")
     @classmethod
@@ -153,7 +155,15 @@ class AgentConfig(BaseModel):
                 raise ValueError("provider configuration contains unsupported fields")
 
         if self.provider == "openai_compatible":
-            reject({"credential_env", "scope", "folder_id", "credential_kind"})
+            reject(
+                {
+                    "credential_env",
+                    "scope",
+                    "folder_id",
+                    "credential_kind",
+                    "verify_ssl_certs",
+                }
+            )
             if self.api_key_env is None:
                 self.api_key_env = "OPENAI_API_KEY"
             return self
@@ -166,7 +176,7 @@ class AgentConfig(BaseModel):
                 self.scope = "GIGACHAT_API_PERS"
             return self
 
-        reject({"base_url", "api_key_env", "scope"})
+        reject({"base_url", "api_key_env", "scope", "verify_ssl_certs"})
         if self.credential_env is None or self.folder_id is None:
             raise ValueError(
                 "Yandex AI Studio requires provider credentials and folder"

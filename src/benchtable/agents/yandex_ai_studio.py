@@ -154,9 +154,17 @@ class YandexAIStudioAgent:
             native_request["max_tokens"] = self._max_completion_tokens
         response: Any | None = None
         try:
-            model = self._get_client().chat.completions(self._model)
+            client = self._get_client()
+            model = client.chat.completions(self._model)
             configure_kwargs: dict[str, Any] = {
-                "tools": native_request["tools"],
+                "tools": [
+                    client.tools.function(
+                        tool.parameters,
+                        name=tool.name,
+                        description=tool.description,
+                    )
+                    for tool in request.tools
+                ],
                 "parallel_tool_calls": False,
             }
             if self._max_completion_tokens is not None:

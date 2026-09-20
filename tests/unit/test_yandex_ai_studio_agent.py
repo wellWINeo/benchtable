@@ -51,8 +51,16 @@ class _Model:
         self._response = response
 
     def configure(self, **kwargs: Any) -> _Configured:
+        if any(isinstance(tool, dict) for tool in kwargs.get("tools", [])):
+            raise TypeError("Yandex tools must be SDK tool objects")
         self.kwargs = kwargs
         return _Configured(self._response)
+
+
+class _SdkTool:
+    def __init__(self, parameters: dict[str, Any], kwargs: dict[str, Any]) -> None:
+        self.parameters = parameters
+        self.kwargs = kwargs
 
 
 class _SDK:
@@ -60,6 +68,10 @@ class _SDK:
         self.model = model
         self.chat = self
         self.completions = self
+        self.tools = self
+
+    def function(self, parameters: dict[str, Any], **kwargs: Any) -> object:
+        return _SdkTool(parameters, kwargs)
 
     def __call__(self, model: str) -> _Model:
         return self.model

@@ -19,6 +19,26 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
 
 
 class TestEngineTrace:
+    async def test_reports_match_progress(self, tmp_path: Path) -> None:
+        progress: list[tuple[int, int, bool]] = []
+        engine = RunEngine(
+            game=TinyGame(),
+            agent=FakeAgent(tool_name="act"),
+            run_dir=tmp_path / "run",
+            run_id="trace-test",
+            seed=42,
+            matches=2,
+            max_turns=20,
+            progress_callback=lambda completed, total, success: progress.append(
+                (completed, total, success)
+            ),
+        )
+
+        result = await engine.run()
+
+        assert result.success
+        assert progress == [(1, 2, True), (2, 2, True)]
+
     async def test_complete_trace_has_all_event_types(self, tmp_path: Path) -> None:
         engine = RunEngine(
             game=TinyGame(),

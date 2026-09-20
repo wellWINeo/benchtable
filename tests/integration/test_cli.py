@@ -190,6 +190,7 @@ class TestRunCommand:
             "scope": "GIGACHAT_API_PERS",
             "timeout": 30.0,
             "max_completion_tokens": 128,
+            "verify_ssl_certs": True,
         }
 
     def test_default_agent_factory_dispatches_yandex_adapter(
@@ -519,6 +520,7 @@ class TestRunCommand:
                 "credential_kind": None,
                 "timeout": None,
                 "max_completion_tokens": 128,
+                "verify_ssl_certs": True,
             }
         ]
 
@@ -605,6 +607,7 @@ class TestRunCommand:
                 "credential_kind": None,
                 "timeout": 1.5,
                 "max_completion_tokens": 64,
+                "verify_ssl_certs": True,
             },
             {
                 "id": "b",
@@ -619,6 +622,7 @@ class TestRunCommand:
                 "credential_kind": None,
                 "timeout": 2.0,
                 "max_completion_tokens": 32,
+                "verify_ssl_certs": True,
             },
         ]
         assert "FAKE_A_KEY" in json.dumps(run_config)
@@ -1123,6 +1127,8 @@ class TestRunCommand:
         )
 
         assert result.exit_code == 0
+        assert "Running 1 match(es)..." in result.output
+        assert "Match 1/1 completed" in result.output
         # Should produce an events.jsonl
         trace_path = output_dir / "events.jsonl"
         assert trace_path.exists()

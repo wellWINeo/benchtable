@@ -97,6 +97,28 @@ def test_gigachat_maps_function_calls_and_client_settings(monkeypatch: Any) -> N
     assert "reasoning_content" not in str(response.raw_provider_response)
 
 
+def test_gigachat_can_disable_tls_verification_for_local_testing(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("GIGA_ENV", "configured-value")
+    construction: dict[str, Any] = {}
+
+    def factory(**kwargs: Any) -> _Client:
+        construction.update(kwargs)
+        return _Client({})
+
+    agent = GigaChatAgent(
+        model="GigaChat-3-Ultra",
+        credential_env="GIGA_ENV",
+        scope="GIGACHAT_API_PERS",
+        verify_ssl_certs=False,
+        _client_factory=factory,
+    )
+    asyncio.run(agent.respond(_request()))
+
+    assert construction["verify_ssl_certs"] is False
+
+
 def test_gigachat_continuation_uses_object_arguments_and_sanitized_trace_request(
     monkeypatch: Any,
 ) -> None:
@@ -152,6 +174,53 @@ def test_gigachat_continuation_uses_object_arguments_and_sanitized_trace_request
     assert second_response.raw_provider_request is not None
     assert "functions_state_id" not in str(second_response.raw_provider_request)
     assert "reasoning_content" not in str(second_response.raw_provider_request)
+
+
+def test_gigachat_encodes_plain_validation_errors_as_function_results(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("GIGA_ENV", "configured-value")
+    agent = GigaChatAgent(
+        model="GigaChat-3-Ultra",
+        credential_env="GIGA_ENV",
+        scope="GIGACHAT_API_PERS",
+        _client_factory=lambda **kwargs: _Client({}),
+    )
+
+    messages = agent._to_gigachat_messages(
+        AgentRequest(
+            actor_id="a",
+            system_prompt="system",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "act",
+                                "arguments": '{"choice":"go"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "Validation error: invalid action",
+                },
+            ],
+            tools=[],
+        )
+    )
+
+    assert messages[-1] == {
+        "role": "function",
+        "name": "act",
+        "content": '{"error":"Validation error: invalid action"}',
+    }
 
 
 @pytest.mark.parametrize("arguments", ["not json", "[]", '{"choice":NaN}'])

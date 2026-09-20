@@ -32,6 +32,12 @@ def _safe_error_message(error: BaseException) -> str:
     return cast(str, redact_value(str(error)))
 
 
+def _report_match_progress(completed: int, total: int, success: bool) -> None:
+    """Print progress after each match without mixing with the result path."""
+    status = "completed" if success else "failed"
+    typer.echo(f"Match {completed}/{total} {status}", err=True)
+
+
 def _get_registry() -> GameRegistry:
     """Create and populate the game registry."""
     global _registry
@@ -83,6 +89,7 @@ def _default_agent_factory(agent_config: AgentConfig) -> Agent:
                 scope=scope,
                 timeout=agent_config.timeout,
                 max_completion_tokens=agent_config.max_completion_tokens,
+                verify_ssl_certs=agent_config.verify_ssl_certs,
             )
         case "yandex_ai_studio":
             from benchtable.agents.yandex_ai_studio import YandexAIStudioAgent
@@ -201,6 +208,7 @@ def run_experiment(
 
     try:
         output.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"Running {cfg.run.matches} match(es)...", err=True)
 
         from benchtable.engine import RunEngine
 
@@ -219,6 +227,7 @@ def run_experiment(
             max_invalid_attempts=cfg.run.max_invalid_attempts,
             max_provider_retries=cfg.run.max_provider_retries,
             max_memory_operations_per_turn=cfg.run.max_memory_operations_per_turn,
+            progress_callback=_report_match_progress,
         )
         result = asyncio.run(engine.run())
     except Exception as exc:

@@ -101,6 +101,7 @@ class RunEngine:
         max_invalid_attempts: int = 2,
         max_provider_retries: int = 2,
         max_memory_operations_per_turn: int = 4,
+        progress_callback: Callable[[int, int, bool], None] | None = None,
     ) -> None:
         self._game = game
         self._agent = agent
@@ -115,6 +116,7 @@ class RunEngine:
         self._max_turns = max_turns
         self._max_invalid_attempts = max_invalid_attempts
         self._max_provider_retries = max_provider_retries
+        self._progress_callback = progress_callback
         if type(max_memory_operations_per_turn) is not int or (
             max_memory_operations_per_turn < 0
         ):
@@ -149,6 +151,10 @@ class RunEngine:
                     matches_completed += 1
                 else:
                     matches_failed += 1
+                if self._progress_callback is not None:
+                    self._progress_callback(
+                        match_idx + 1, self._matches, outcome.success
+                    )
                 if outcome.cancelled:
                     break
 

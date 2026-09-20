@@ -79,6 +79,7 @@ class GigaChatAgent:
         scope: str,
         timeout: float | None = None,
         max_completion_tokens: int | None = None,
+        verify_ssl_certs: bool = True,
         _client_factory: _ClientFactory | None = None,
     ) -> None:
         if type(model) is not str or not model.strip():
@@ -110,6 +111,7 @@ class GigaChatAgent:
         self._scope = scope
         self._timeout = timeout
         self._max_completion_tokens = max_completion_tokens
+        self._verify_ssl_certs = verify_ssl_certs
         self._client_factory = _client_factory or _default_client_factory
         self._client: Any | None = None
         self._functions_state: dict[str, str] = {}
@@ -120,7 +122,7 @@ class GigaChatAgent:
                 credentials=os.environ[self._credential_env],
                 scope=self._scope,
                 model=self._model,
-                verify_ssl_certs=True,
+                verify_ssl_certs=self._verify_ssl_certs,
                 max_retries=0,
                 timeout=self._timeout,
             )
@@ -141,11 +143,16 @@ class GigaChatAgent:
                         provider="gigachat",
                         model=self._model,
                     )
+                content = self._require_content(message)
+                try:
+                    json.loads(content)
+                except json.JSONDecodeError:
+                    content = json.dumps({"error": content}, separators=(",", ":"))
                 messages.append(
                     {
                         "role": "function",
                         "name": pending.pop(call_id),
-                        "content": self._require_content(message),
+                        "content": content,
                     }
                 )
                 self._functions_state.pop(call_id, None)

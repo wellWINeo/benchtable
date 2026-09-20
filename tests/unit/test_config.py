@@ -151,6 +151,27 @@ class TestLoadConfig:
 
         assert cfg.agents[0].scope == "GIGACHAT_API_PERS"
 
+    def test_gigachat_tls_verification_can_be_disabled(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "gigachat.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "player-1"
+            provider = "gigachat"
+            model = "GigaChat-3-Ultra"
+            credential_env = "GIGA_ENV"
+            verify_ssl_certs = false
+        """)
+        )
+
+        cfg = load_config(cfg_path)
+
+        assert cfg.agents[0].verify_ssl_certs is False
+
     def test_optional_base_url(self, tmp_path: Path) -> None:
         cfg_path = tmp_path / "test.toml"
         cfg_path.write_text(
