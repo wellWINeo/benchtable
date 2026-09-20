@@ -11,3 +11,4 @@ build/
 runs/
 *.jsonl
 .env
+configs/*
