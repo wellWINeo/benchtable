@@ -2737,7 +2737,7 @@ class TestRunEngine:
         assert turn_end["turn_index"] == 0
         assert turn_end["actor_id"] == "a"
 
-    async def test_provider_exhaustion_does_not_invoke_failed_turn_handler(
+    async def test_provider_exhaustion_invokes_failed_turn_handler(
         self, tmp_path: Path
     ) -> None:
         game = TinyGame(failed_turn_recovery=True)
@@ -2754,8 +2754,8 @@ class TestRunEngine:
 
         result = await engine.run()
 
+        assert game.failed_turn_calls == ["provider_retries_exhausted"]
         assert not result.success
-        assert game.failed_turn_calls == []
 
     async def test_missing_failed_turn_handler_is_an_ordinary_failure(
         self, tmp_path: Path
@@ -2993,3 +2993,185 @@ class TestRunEngine:
                 run_dir=tmp_path / "run",
                 max_memory_operations_per_turn=value,  # type: ignore[arg-type]
             )
+
+
+class TestRecoverableTurnFailureRouting:
+    """Game-attributable turn failures route to the session failed-turn handler."""
+
+    @staticmethod
+    def _engine(tmp_path: Path, game: TinyGame, agent: Any, **kwargs: Any) -> RunEngine:
+        return RunEngine(
+            game=game,
+            agent=agent,
+            run_dir=tmp_path / "run",
+            run_id="recoverable-routing-test",
+            **kwargs,
+        )
+
+    async def test_provider_retry_exhaustion_routes_to_handler(
+        self, tmp_path: Path
+    ) -> None:
+        game = TinyGame(failed_turn_recovery=True, recovery_terminates=True)
+        agent = FakeAgent(
+            raise_on_respond=ProviderError(
+                "provider down", provider="openai", model="m"
+            )
+        )
+        engine = self._engine(
+            tmp_path, game, agent, max_turns=1, max_provider_retries=1
+        )
+
+        result = await engine.run()
+        events = _read_events(tmp_path / "run")
+
+        assert result.success
+        assert game.failed_turn_calls == ["provider_retries_exhausted"]
+        assert any(
+            event["event_type"] == "turn_end"
+            and event["payload"].get("status") == "failed"
+            and event["payload"].get("failure_reason") == "provider_retries_exhausted"
+            for event in events
+        )
+        assert any(
+            event["event_type"] == "transition"
+            and event["payload"].get("recovery") is True
+            for event in events
+        )
+        match_end = next(
+            event for event in events if event["event_type"] == "match_end"
+        )
+        assert match_end["payload"]["result"]["completed"] is True
+
+    async def test_provider_timeout_routes_to_handler(self, tmp_path: Path) -> None:
+        game = TinyGame(failed_turn_recovery=True, recovery_terminates=True)
+        agent = FakeAgent(raise_on_respond=TimeoutError("too slow"))
+        engine = self._engine(
+            tmp_path, game, agent, max_turns=1, max_provider_retries=1
+        )
+
+        result = await engine.run()
+        events = _read_events(tmp_path / "run")
+
+        assert result.success
+        assert game.failed_turn_calls == ["provider_retries_exhausted"]
+        assert any(
+            event["event_type"] == "transition"
+            and event["payload"].get("recovery") is True
+            for event in events
+        )
+        match_end = next(
+            event for event in events if event["event_type"] == "match_end"
+        )
+        assert match_end["payload"]["result"]["completed"] is True
+
+    async def test_memory_budget_exhaustion_routes_to_handler(
+        self, tmp_path: Path
+    ) -> None:
+        game = TinyGame(failed_turn_recovery=True, recovery_terminates=True)
+        memory_only = ModelResponse(
+            assistant_text="Checking my notes.",
+            tool_calls=[
+                ToolCall(call_id="m1", name="read_memory", arguments={}),
+            ],
+            finish_reason="stop",
+        )
+        engine = self._engine(
+            tmp_path,
+            game,
+            FakeAgent(responses=memory_only),
+            max_turns=1,
+            max_memory_operations_per_turn=0,
+        )
+
+        result = await engine.run()
+        events = _read_events(tmp_path / "run")
+
+        assert result.success
+        assert game.failed_turn_calls == ["memory_budget_exhausted"]
+        assert any(
+            event["event_type"] == "transition"
+            and event["payload"].get("recovery") is True
+            for event in events
+        )
+
+    async def test_finalization_tool_calls_route_to_handler(
+        self, tmp_path: Path
+    ) -> None:
+        game = TinyGame(failed_turn_recovery=True, recovery_terminates=True)
+        action = ModelResponse(
+            assistant_text="Acting.",
+            tool_calls=[ToolCall(call_id="a1", name="act", arguments={})],
+            finish_reason="stop",
+        )
+        finalization_tool_call = ModelResponse(
+            assistant_text="",
+            tool_calls=[ToolCall(call_id="f1", name="read_memory", arguments={})],
+            finish_reason="stop",
+        )
+        engine = self._engine(
+            tmp_path,
+            game,
+            _ResponseSequenceAgent([action, finalization_tool_call]),
+            max_turns=1,
+        )
+
+        result = await engine.run()
+        events = _read_events(tmp_path / "run")
+
+        assert result.success
+        assert game.failed_turn_calls == ["finalization_tool_calls"]
+        assert any(
+            event["event_type"] == "transition"
+            and event["payload"].get("recovery") is True
+            for event in events
+        )
+
+    async def test_unrouted_failure_still_fails_match(self, tmp_path: Path) -> None:
+        game = TinyGame()
+        engine = self._engine(
+            tmp_path,
+            game,
+            FakeAgent(raise_on_respond=ProviderError("provider down")),
+            max_turns=1,
+            max_provider_retries=0,
+        )
+
+        result = await engine.run()
+        events = _read_events(tmp_path / "run")
+
+        assert not result.success
+        assert game.failed_turn_calls == ["provider_retries_exhausted"]
+        assert not any(
+            event["event_type"] == "transition"
+            and event["payload"].get("recovery") is True
+            for event in events
+        )
+        match_end = next(
+            event for event in events if event["event_type"] == "match_end"
+        )
+        assert match_end["payload"]["failure_reason"] == "provider_retries_exhausted"
+        assert match_end["payload"]["result"]["completed"] is False
+
+    async def test_cancellation_is_never_routed(self, tmp_path: Path) -> None:
+        game = TinyGame(failed_turn_recovery=True, recovery_terminates=True)
+        engine = self._engine(
+            tmp_path,
+            game,
+            FakeAgent(raise_on_respond=asyncio.CancelledError()),
+            max_turns=1,
+        )
+
+        result = await engine.run()
+        events = _read_events(tmp_path / "run")
+
+        assert not result.success
+        assert game.failed_turn_calls == []
+        assert not any(
+            event["event_type"] == "transition"
+            and event["payload"].get("recovery") is True
+            for event in events
+        )
+        match_end = next(
+            event for event in events if event["event_type"] == "match_end"
+        )
+        assert match_end["payload"]["failure_reason"] == "cancelled"

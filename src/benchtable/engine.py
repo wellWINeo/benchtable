@@ -74,6 +74,16 @@ class _ActionResponse:
 
 _RESERVED_MEMORY_TOOLS = frozenset({"read_memory", "write_memory"})
 
+_RECOVERABLE_TURN_FAILURES = frozenset(
+    {
+        "invalid_attempts_exhausted",
+        "memory_budget_exhausted",
+        "finalization_tool_calls",
+        "finalization_empty_response",
+        "provider_retries_exhausted",
+    }
+)
+
 
 @dataclass(frozen=True)
 class _MatchOutcome:
@@ -1699,7 +1709,7 @@ class RunEngine:
         failure: _TurnFailure,
     ) -> _MatchOutcome | None:
         if (
-            failure.reason == "invalid_attempts_exhausted"
+            failure.reason in _RECOVERABLE_TURN_FAILURES
             and failure.actor_id is not None
         ):
             handler = getattr(session, "handle_failed_turn", None)
