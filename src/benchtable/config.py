@@ -89,6 +89,7 @@ def _is_strict_json_value(value: object) -> bool:
 
 ProviderName = Literal["openai_compatible", "gigachat", "yandex_ai_studio"]
 YandexCredentialKind = Literal["oauth", "api_key"]
+JudgeAdapterName = Literal["openrouter_decisions"]
 
 
 class AgentConfig(BaseModel):
@@ -186,6 +187,60 @@ class AgentConfig(BaseModel):
         return self
 
 
+class JudgeConfig(BaseModel):
+    """Configuration for one judge."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StrictStr = Field(min_length=1)
+    adapter: JudgeAdapterName = "openrouter_decisions"
+    model: StrictStr = Field(min_length=1)
+    base_url: StrictStr | None = Field(default=None, min_length=1)
+    api_key_env: StrictStr | None = None
+    timeout: float | None = Field(default=None, gt=0)
+    max_retries: StrictInt = Field(default=2, ge=0)
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def validate_timeout(cls, value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            if type(value) is int:
+                numeric_value = float(value)
+            elif type(value) is float:
+                numeric_value = value
+            else:
+                raise ValueError("Timeout must be a finite positive number")
+        except OverflowError as exc:
+            raise ConfigurationError(
+                "Timeout must be a finite positive number"
+            ) from exc
+        if not math.isfinite(numeric_value) or numeric_value <= 0:
+            raise ValueError("Timeout must be a finite positive number")
+        return numeric_value
+
+    @field_validator("model")
+    @classmethod
+    def reject_rolling_alias(cls, value: str) -> str:
+        if value.startswith("~"):
+            raise ValueError("Judge model must be a pinned ID, not a rolling alias")
+        return value
+
+    @field_validator("id", "model", "base_url", "api_key_env")
+    @classmethod
+    def reject_whitespace_only_strings(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Judge strings must not be whitespace-only")
+        return value
+
+    @model_validator(mode="after")
+    def default_api_key_env(self) -> JudgeConfig:
+        if self.api_key_env is None:
+            self.api_key_env = "OPENROUTER_API_KEY"
+        return self
+
+
 class RunConfig(BaseModel):
     """Run-level configuration."""
 
@@ -234,6 +289,7 @@ class ExperimentConfig(BaseModel):
 
     run: RunConfig
     agents: list[AgentConfig] = Field(min_length=1)
+    judges: list[JudgeConfig] = Field(default_factory=list[JudgeConfig])
 
     @field_validator("agents")
     @classmethod
@@ -241,6 +297,14 @@ class ExperimentConfig(BaseModel):
         agent_ids = [agent.id for agent in value]
         if len(agent_ids) != len(set(agent_ids)):
             raise ValueError("Agent IDs must be unique")
+        return value
+
+    @field_validator("judges")
+    @classmethod
+    def reject_duplicate_judge_ids(cls, value: list[JudgeConfig]) -> list[JudgeConfig]:
+        ids = [judge.id for judge in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Judge IDs must be unique")
         return value
 
 
