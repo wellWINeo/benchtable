@@ -31,6 +31,15 @@ def _speak(
     session.apply_action(actor_id, "bunker_speak", arguments)
 
 
+def _vote(session: BunkerSession, actor_id: str, target_id: str) -> None:
+    session.apply_action(actor_id, "bunker_vote_eliminate", {"target_id": target_id})
+
+
+def _run_discussion(session: BunkerSession, speakers: list[str]) -> None:
+    for actor_id in speakers:
+        _speak(session, actor_id)
+
+
 def _dossier_values(observation_text: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for category in ("profession", "health", "skill", "trait"):
@@ -147,8 +156,10 @@ def test_speak_validation_rejects_bad_actions() -> None:
     assert session.get_observation("p1").metadata["phase"] == "ballot"
     with pytest.raises(InvalidActionError):
         _speak(session, "p1", "speaking during ballots")
-    with pytest.raises(InvalidActionError):
-        session.apply_action("p1", "bunker_vote_eliminate", {"target_id": "p2"})
+
+    # Ballots are legal in the ballot phase for the scheduled voter.
+    _vote(session, "p1", "p2")
+    assert session.current_actor_id == "p2"
 
 
 def test_rotation_and_ballot_phase_switch() -> None:
@@ -213,3 +224,141 @@ def test_plugin_factory_contract() -> None:
     assert isinstance(session, BunkerSession)
     assert session.current_actor_id == "p1"
     assert "sealed shelter" in session.get_observation("p1").text
+
+
+def test_ballot_rotation_and_plurality_elimination() -> None:
+    session = _session()
+    _run_discussion(session, PLAYERS)
+
+    for expected_voter in PLAYERS:
+        assert session.current_actor_id == expected_voter
+        tools = session.get_tools(expected_voter)
+        assert [tool.name for tool in tools] == ["bunker_vote_eliminate"]
+        target = "p3" if expected_voter == "p2" else "p2"
+        _vote(session, expected_voter, target)
+
+    # votes: p1->p2, p2->p3, p3->p2, p4->p2 => p2 has the plurality
+    assert not session.is_terminal
+    view = session.get_observation("p1")
+    assert view.metadata["phase"] == "discuss"
+    assert view.metadata["round_index"] == 1
+    assert view.metadata["survivors"] == ["p1", "p3", "p4"]
+    assert "vote totals: p2: 3, p3: 1" in view.text
+    assert "p2 eliminated (no tie break)" in view.text
+
+
+def test_tie_break_deterministic_for_seed_and_recorded() -> None:
+
+    def run(seed: int) -> BunkerSession:
+        tie = BunkerSession(
+            players=list(PLAYERS),
+            scenario="sealed shelter",
+            shelter_capacity=3,
+            seed=seed,
+        )
+        _run_discussion(tie, PLAYERS)
+        _vote(tie, "p1", "p2")
+        _vote(tie, "p2", "p3")
+        _vote(tie, "p3", "p2")
+        _vote(tie, "p4", "p3")
+        return tie
+
+    first = run(seed=11)
+    second = run(seed=11)
+    assert first.is_terminal and second.is_terminal
+    assert first._eliminations == second._eliminations
+    assert first._eliminations[0]["tie_break"] is True
+    assert first._eliminations[0]["target"] in {"p2", "p3"}
+
+    other_seed = run(seed=12)
+    assert other_seed._eliminations[0]["target"] in {"p2", "p3"}
+
+    view = first.get_observation("p1")
+    assert "vote totals: p2: 2, p3: 2" in view.text
+    assert re.search(
+        rf"\[\d+\] {first._eliminations[0]['target']} eliminated \(tie break\)",
+        view.text,
+    )
+
+
+def test_vote_validation_rejects_bad_ballots() -> None:
+    session = _session()
+
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p2")  # discuss phase
+
+    _run_discussion(session, PLAYERS)
+
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p2", "p3")  # out of turn
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p1")  # self-vote
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "   ")  # blank target
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p9")  # unknown target
+    with pytest.raises(InvalidActionError):
+        _speak(session, "p1", "wrong tool for ballots")
+
+    _vote(session, "p1", "p2")
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p3")  # double vote
+
+
+def test_ballot_secrecy_until_closure() -> None:
+    session = _session()
+    _run_discussion(session, PLAYERS)
+
+    _vote(session, "p1", "p3")
+
+    events_before = session.drain_hand_events()
+    for event in events_before:
+        assert "target_id" not in event.payload
+
+    for observer in ("p2", "p3", "p4"):
+        view = session.get_observation(observer)
+        assert "vote totals" not in view.text
+        assert "eliminated" not in view.text
+        assert "against p3" not in view.text
+
+    _vote(session, "p2", "p3")
+    _vote(session, "p3", "p2")
+    _vote(session, "p4", "p3")
+
+    view = session.get_observation("p1")
+    assert "vote totals: p3: 3, p2: 1" in view.text
+    assert "p3 eliminated (no tie break)" in view.text
+
+
+def test_capacity_termination_and_terminal_rejection() -> None:
+    session = _session()
+
+    _run_discussion(session, PLAYERS)
+    _vote(session, "p1", "p2")
+    _vote(session, "p2", "p3")
+    _vote(session, "p3", "p2")
+    _vote(session, "p4", "p2")
+
+    assert not session.is_terminal
+    assert session.get_observation("p1").metadata["survivors"] == ["p1", "p3", "p4"]
+
+    for speaker in ("p1", "p3", "p4"):
+        assert session.current_actor_id == speaker
+        _speak(session, speaker)
+
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p2")  # eliminated player
+
+    _vote(session, "p1", "p3")
+    _vote(session, "p3", "p1")
+    _vote(session, "p4", "p3")
+
+    assert session.is_terminal
+    assert session.get_observation("p1").metadata["survivors"] == ["p1", "p4"]
+
+    with pytest.raises(InvalidActionError):
+        _speak(session, "p1", "after the end")
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p4")
+    with pytest.raises(InvalidActionError):
+        _vote(session, "p1", "p2")

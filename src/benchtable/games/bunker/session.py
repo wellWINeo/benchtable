@@ -8,6 +8,7 @@ from typing import cast
 from benchtable.contracts import (
     GameMetrics,
     JsonObject,
+    JsonValue,
     Observation,
     PluginEvent,
     ToolSpec,
@@ -204,16 +205,138 @@ class BunkerSession:
                 f"[{entry['seq']}] {entry['speaker']} revealed "
                 f"{entry['attribute']}: {entry['value']}"
             )
+        if kind == "vote_totals":
+            totals = cast(dict[str, JsonValue], entry["totals"])
+            rendered = ", ".join(
+                f"{target}: {count}" for target, count in totals.items()
+            )
+            return f"[{entry['seq']}] vote totals: {rendered}"
+        if kind == "elimination":
+            tie = "tie break" if entry["tie_break"] else "no tie break"
+            return f"[{entry['seq']}] {entry['eliminated']} eliminated ({tie})"
         raise ValueError(f"Unknown public event kind: {kind}")
 
     def apply_action(
         self, actor_id: str, tool_name: str, arguments: JsonObject
     ) -> Transition:
+        if self._match_over:
+            raise InvalidActionError("Match is already over")
         if self._phase == "ballot":
+            return self._apply_vote(actor_id, tool_name, arguments)
+        return self._apply_speak(actor_id, tool_name, arguments)
+
+    def _apply_vote(
+        self, actor_id: str, tool_name: str, arguments: JsonObject
+    ) -> Transition:
+        if tool_name != "bunker_vote_eliminate":
+            raise InvalidActionError(f"Unknown tool for the ballot phase: {tool_name}")
+        if actor_id != self.current_actor_id:
             raise InvalidActionError(
-                "bunker_vote_eliminate is not resolved until the ballot phase "
-                "is implemented; bunker_speak is not legal during ballots"
+                f"Not {actor_id}'s turn; current voter is {self.current_actor_id}"
             )
+
+        target = arguments.get("target_id")
+        if not isinstance(target, str) or not target.strip():
+            raise InvalidActionError("bunker_vote_eliminate requires a target_id")
+        if target == actor_id:
+            raise InvalidActionError("You cannot vote for yourself")
+        if target not in self._survivors:
+            raise InvalidActionError(f"Target {target!r} is not a surviving player")
+
+        self._pending_ballots.append(target)
+        self._ballots_cast += 1
+        self._voter_pointer += 1
+        if self._voter_pointer < len(self._survivors):
+            return Transition(
+                summary=f"{actor_id} cast a secret ballot",
+                metrics=cast(
+                    GameMetrics,
+                    {
+                        "round_index": self._round_index,
+                        "ballots_cast": self._ballots_cast,
+                    },
+                ),
+            )
+        return self._close_ballot()
+
+    def _close_ballot(self) -> Transition:
+        totals: dict[str, int] = {}
+        for target in self._pending_ballots:
+            totals[target] = totals.get(target, 0) + 1
+        top = max(totals.values())
+        leaders = sorted(t for t, v in totals.items() if v == top)
+        tie_break = len(leaders) > 1
+        eliminated = leaders[0] if not tie_break else self._rng.choice(leaders)
+        round_index = self._round_index
+
+        self._next_seq += 1
+        self._public_log.append(
+            cast(
+                JsonObject,
+                {
+                    "seq": self._next_seq,
+                    "kind": "vote_totals",
+                    "round_index": round_index,
+                    "totals": dict(totals),
+                },
+            )
+        )
+        self._next_seq += 1
+        self._public_log.append(
+            cast(
+                JsonObject,
+                {
+                    "seq": self._next_seq,
+                    "kind": "elimination",
+                    "round_index": round_index,
+                    "eliminated": eliminated,
+                    "tie_break": tie_break,
+                    "reason": "vote",
+                },
+            )
+        )
+        self._eliminations.append(
+            cast(
+                JsonObject,
+                {
+                    "round_index": round_index,
+                    "target": eliminated,
+                    "reason": "vote",
+                    "tie_break": tie_break,
+                },
+            )
+        )
+        self._survivors.remove(eliminated)
+
+        self._pending_ballots = []
+        if len(self._survivors) == self._capacity:
+            self._match_over = True
+            self._voter_pointer = 0
+        else:
+            self._round_index += 1
+            self._phase = "discuss"
+            self._speaker_pointer = 0
+            self._voter_pointer = 0
+
+        summary = f"{eliminated} was eliminated"
+        if tie_break:
+            summary += " after a tie break"
+        return Transition(
+            summary=summary,
+            metrics=cast(
+                GameMetrics,
+                {
+                    "round_index": round_index,
+                    "eliminated": eliminated,
+                    "tie_break": tie_break,
+                    "survivors": len(self._survivors),
+                },
+            ),
+        )
+
+    def _apply_speak(
+        self, actor_id: str, tool_name: str, arguments: JsonObject
+    ) -> Transition:
         if tool_name != "bunker_speak":
             raise InvalidActionError(
                 f"Unknown tool for the discussion phase: {tool_name}"
