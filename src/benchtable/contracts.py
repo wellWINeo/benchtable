@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     field_validator,
@@ -254,3 +255,31 @@ class MatchMemorySummary(BaseModel):
         if not value.strip():
             raise ValueError("text must not be empty or whitespace-only")
         return value
+
+
+# ---------------------------------------------------------------------------
+# Judgments
+# ---------------------------------------------------------------------------
+
+
+class JudgmentRequest(BaseModel):
+    """A session's request that the engine run one judgment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    judge_id: StrictStr = Field(..., min_length=1)
+    judgment_kind: StrictStr = Field(..., min_length=1)
+    payload: JsonObject
+
+
+class JudgmentOutcome(BaseModel):
+    """Normalized judgment result or typed failure delivered to a session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: StrictBool
+    failure_reason: StrictStr | None = None
+    decision: JsonObject | None = None
+    model: StrictStr | None = None
+    usage: JsonObject | None = None
+    latency_ms: float | None = None

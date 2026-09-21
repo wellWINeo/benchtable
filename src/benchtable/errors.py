@@ -56,3 +56,40 @@ class ProviderError(BenchtableError):
 
 class RunError(BenchtableError):
     """A run-level failure such as exhausted budgets or cancellation."""
+
+
+class JudgeError(BenchtableError):
+    """Base error for judge invocation failures."""
+
+
+class JudgeProviderError(JudgeError):
+    """The judge provider returned an error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        raw_provider_request: JsonObject | None = None,
+        raw_provider_response: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+        self.raw_provider_request = raw_provider_request
+        self.raw_provider_response = raw_provider_response
+
+
+class JudgeTimeoutError(JudgeError):
+    """The judge request timed out."""
+
+
+class JudgeMalformedResponseError(JudgeError):
+    """The judge response could not be normalized."""
+
+    def __init__(
+        self, message: str, *, raw_provider_response: Any | None = None
+    ) -> None:
+        super().__init__(message)
+        self.raw_provider_response = raw_provider_response
