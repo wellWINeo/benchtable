@@ -10,12 +10,14 @@ from typing import Any
 
 import pytest
 from tests.fixtures.fake_agent import FakeAgent
+from tests.fixtures.fake_judge import FakeJudge
+from tests.fixtures.judged_tiny_game import JudgedTinyGame
 from tests.fixtures.tiny_game import TinyGame
 from typer.testing import CliRunner
 
 from benchtable import cli
 from benchtable.cli import app
-from benchtable.config import AgentConfig
+from benchtable.config import AgentConfig, JudgeConfig
 from benchtable.errors import PluginError, ProviderError
 
 runner = CliRunner()
@@ -27,6 +29,7 @@ def _reset_cli_overrides() -> Any:
     yield
     cli.set_registry(None)
     cli.set_agent_factory(None)
+    cli.set_judge_factory(None)
 
 
 class TestListGames:
@@ -1334,3 +1337,275 @@ class TestRunCommand:
         assert result.exit_code != 0
         assert "missing" in result.output.lower() or "unknown" in result.output.lower()
         assert constructed == []
+
+
+class TestJudgeWiring:
+    """Judge construction, trace metadata, and the min_max_turns seam."""
+
+    def _register(self, plugin: Any) -> None:
+        from benchtable.games.registry import GameRegistry
+
+        registry = GameRegistry()
+        registry.register(plugin)
+        cli.set_registry(registry)
+
+    def _min_turns_game(self, minimum: int) -> Any:
+        class _MinTurnsGame(TinyGame):
+            @property
+            def name(self) -> str:
+                return "min-turns"
+
+            def min_max_turns(self, game_config: dict) -> int:
+                return minimum
+
+        return _MinTurnsGame()
+
+    def test_default_judge_factory_builds_openrouter_adapter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from benchtable.judges.openrouter_decisions import OpenRouterDecisionsJudge
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "construction-only-key")
+        judge = cli._default_judge_factory(
+            JudgeConfig(id="j1", model="typesafe/jev-1.13")
+        )
+
+        assert isinstance(judge, OpenRouterDecisionsJudge)
+        assert judge.judge_id == "j1"
+
+    def test_run_with_judges_records_metadata_and_completes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TEST_JUDGE_KEY", "supersecret-judge-key")
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        judge = FakeJudge(judge_id="tiny-judge")
+        cli.set_judge_factory(lambda judge_config: judge)
+        self._register(JudgedTinyGame())
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "judged-tiny"
+            matches = 1
+            seed = 7
+            max_turns = 20
+
+            [[agents]]
+            id = "a"
+            role = "player"
+            model = "fake-model"
+
+            [[judges]]
+            id = "tiny-judge"
+            model = "typesafe/jev-1.13"
+            api_key_env = "TEST_JUDGE_KEY"
+        """)
+        )
+
+        output_dir = tmp_path / "out"
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(output_dir)],
+        )
+
+        assert result.exit_code == 0
+        assert "Match 1/1 completed" in result.output
+
+        raw = (output_dir / "events.jsonl").read_text()
+        assert "supersecret-judge-key" not in raw
+        events = [json.loads(line) for line in raw.splitlines() if line]
+        run_config = events[0]
+        assert run_config["event_type"] == "run_config"
+        assert run_config["payload"]["judges"] == [
+            {
+                "id": "tiny-judge",
+                "adapter": "openrouter_decisions",
+                "model": "typesafe/jev-1.13",
+                "base_url": None,
+                "api_key_env": "TEST_JUDGE_KEY",
+                "timeout": None,
+                "max_retries": 2,
+            }
+        ]
+        assert any(event["event_type"] == "judge_request" for event in events)
+        assert any(event["event_type"] == "judge_response" for event in events)
+
+    def test_missing_judge_api_key_env_fails_before_matches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        self._register(TinyGame())
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_turns = 20
+
+            [[agents]]
+            id = "a"
+            role = "player"
+            model = "fake-model"
+
+            [[judges]]
+            id = "j1"
+            model = "typesafe/jev-1.13"
+        """)
+        )
+
+        output_dir = tmp_path / "out"
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(output_dir)],
+        )
+
+        assert result.exit_code == 1
+        assert "Judge error:" in result.output
+        assert "OPENROUTER_API_KEY" in result.output
+        assert "Running 1 match(es)..." not in result.output
+        assert not (output_dir / "events.jsonl").exists()
+
+    def test_duplicate_judge_ids_fail_configuration_validation(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake-model"
+
+            [[judges]]
+            id = "j1"
+            model = "typesafe/jev-1.13"
+
+            [[judges]]
+            id = "j1"
+            model = "typesafe/jev-1.13"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 1
+        assert "Configuration error" in result.output
+
+    def test_rolling_alias_judge_model_fails_configuration_validation(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+
+            [[agents]]
+            id = "a"
+            model = "fake-model"
+
+            [[judges]]
+            id = "j1"
+            model = "~typesafe/jev-latest"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 1
+        assert "Configuration error" in result.output
+
+    def test_max_turns_below_game_minimum_is_rejected(self, tmp_path: Path) -> None:
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        self._register(self._min_turns_game(135))
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "min-turns"
+            matches = 1
+            max_turns = 134
+
+            [[agents]]
+            id = "a"
+            model = "fake-model"
+        """)
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 1
+        assert "run.max_turns=134" in result.output
+        assert "minimum 135" in result.output
+        assert "min-turns" in result.output
+
+    def test_max_turns_meeting_game_minimum_proceeds(self, tmp_path: Path) -> None:
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        self._register(self._min_turns_game(135))
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "min-turns"
+            matches = 1
+            max_turns = 135
+
+            [[agents]]
+            id = "a"
+            model = "fake-model"
+        """)
+        )
+
+        output_dir = tmp_path / "out"
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(output_dir)],
+        )
+
+        assert result.exit_code == 0
+        assert (output_dir / "events.jsonl").exists()
+
+    def test_plugin_without_min_max_turns_is_unaffected(self, tmp_path: Path) -> None:
+        cli.set_agent_factory(lambda agent_config: FakeAgent(tool_name="act"))
+        self._register(TinyGame(max_actions=2))
+
+        cfg_path = tmp_path / "test.toml"
+        cfg_path.write_text(
+            textwrap.dedent("""\
+            [run]
+            game = "tiny"
+            matches = 1
+            max_turns = 2
+
+            [[agents]]
+            id = "a"
+            model = "fake-model"
+        """)
+        )
+
+        output_dir = tmp_path / "out"
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(output_dir)],
+        )
+
+        assert result.exit_code == 0
