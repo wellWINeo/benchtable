@@ -362,3 +362,123 @@ def test_capacity_termination_and_terminal_rejection() -> None:
         _vote(session, "p1", "p4")
     with pytest.raises(InvalidActionError):
         _vote(session, "p1", "p2")
+
+
+def _scripted_full_match(seed: int = 5) -> BunkerSession:
+    """4 players, capacity 2: p2 eliminated in round 1, p3 in round 2."""
+    session = _session(seed=seed)
+    _run_discussion(session, PLAYERS)
+    _vote(session, "p1", "p2")
+    _vote(session, "p2", "p3")
+    _vote(session, "p3", "p2")
+    _vote(session, "p4", "p2")
+    _run_discussion(session, ["p1", "p3", "p4"])
+    _vote(session, "p1", "p3")
+    _vote(session, "p3", "p1")
+    _vote(session, "p4", "p3")
+    return session
+
+
+def test_completed_result_contract() -> None:
+    session = _scripted_full_match()
+    assert session.is_terminal
+
+    result = session.get_result()
+    assert result.completed is True
+    assert result.outcome["admitted"] == ["p1", "p4"]
+    assert result.outcome["excluded"] == ["p2", "p3"]
+    assert result.outcome["elimination_order"] == ["p2", "p3"]
+    assert result.outcome["scenario"] == "sealed shelter"
+    assert result.outcome["capacity"] == 2
+    assert result.outcome["completion_reason"] == "capacity_reached"
+
+    metrics = result.metrics
+    assert metrics["elimination_rounds"] == 2
+    assert metrics["speeches"] == 7
+    assert metrics["ballots_cast"] == 7
+    assert metrics["reveals_total"] == 0
+    assert metrics["reveal_counts"] == {pid: 0 for pid in PLAYERS}
+    assert metrics["failed_turn_eliminations"] == 0
+    assert metrics["completed"] is True
+
+
+def test_in_progress_result_contract() -> None:
+    session = _session()
+    _speak(session, "p1")
+
+    result = session.get_result()
+    assert result.completed is False
+    assert result.outcome["admitted"] == PLAYERS
+    assert result.outcome["excluded"] == []
+    assert result.outcome["elimination_order"] == []
+    assert result.outcome["scenario"] == "sealed shelter"
+    assert result.outcome["capacity"] == 2
+    assert result.outcome["completion_reason"] == "in_progress"
+    assert result.metrics["completed"] is False
+    assert result.metrics["elimination_rounds"] == 0
+    assert result.metrics["speeches"] == 1
+
+
+def test_reveals_counted_in_result_metrics() -> None:
+    session = _session()
+    _speak(session, "p1", "my contribution", reveal_attribute="skill")
+    _speak(session, "p2", "no reveal from me")
+
+    result = session.get_result()
+    assert result.metrics["reveals_total"] == 1
+    assert result.metrics["reveal_counts"]["p1"] == 1
+    assert result.metrics["reveal_counts"]["p2"] == 0
+    assert result.metrics["speeches"] == 2
+
+
+def test_plugin_events_lifecycle_and_public_safety() -> None:
+    session = _scripted_full_match()
+
+    events = session.drain_hand_events()
+    types = [event.event_type for event in events]
+
+    assert types[0] == "round_start"
+    assert types.count("round_start") == 2
+    assert types.count("bunker_speak") == 7
+    assert types.count("bunker_reveal") == 0
+    assert types.count("bunker_vote_totals") == 2
+    assert types.count("bunker_elimination") == 2
+    assert types[-1] == "match_end"
+
+    round_start = events[0]
+    assert round_start.payload["round_index"] == 0
+    assert round_start.payload["survivors"] == PLAYERS
+
+    vote_totals = [e for e in events if e.event_type == "bunker_vote_totals"]
+    assert vote_totals[0].payload["round_index"] == 0
+    assert vote_totals[0].payload["totals"] == {"p2": 3, "p3": 1}
+    assert vote_totals[1].payload["round_index"] == 1
+    assert vote_totals[1].payload["totals"] == {"p3": 2, "p1": 1}
+
+    eliminations = [e for e in events if e.event_type == "bunker_elimination"]
+    assert eliminations[0].payload["eliminated"] == "p2"
+    assert eliminations[0].payload["tie_break"] is False
+    assert eliminations[0].payload["reason"] == "vote"
+    assert eliminations[1].payload["eliminated"] == "p3"
+
+    match_end = events[-1]
+    assert match_end.payload["admitted"] == ["p1", "p4"]
+    assert match_end.payload["excluded"] == ["p2", "p3"]
+    assert match_end.payload["completion_reason"] == "capacity_reached"
+
+    # Drain clears the queue.
+    assert session.drain_hand_events() == []
+
+    # Public safety: no unrevealed dossier values, no individual ballots.
+    reference = _session(seed=5)
+    hidden = {
+        _dossier_values(reference.get_observation(pid).text)[category]
+        for pid in PLAYERS
+        for category in ("profession", "health", "skill", "trait")
+    }
+    for event in events:
+        assert "target_id" not in event.payload
+        assert "ballots" not in event.payload
+        blob = str(event.payload)
+        for value in hidden:
+            assert value not in blob, f"dossier value {value!r} leaked into trace"

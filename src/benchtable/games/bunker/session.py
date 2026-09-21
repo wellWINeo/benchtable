@@ -7,6 +7,7 @@ from typing import cast
 
 from benchtable.contracts import (
     GameMetrics,
+    GameResult,
     JsonObject,
     JsonValue,
     Observation,
@@ -113,6 +114,16 @@ class BunkerSession:
         self._reveal_counts: dict[str, int] = {pid: 0 for pid in players}
         self._ballots_cast = 0
         self._failed_eliminations = 0
+
+        self._events.append(
+            PluginEvent(
+                event_type="round_start",
+                payload=cast(
+                    JsonObject,
+                    {"round_index": 0, "survivors": list(self._survivors)},
+                ),
+            )
+        )
 
     @property
     def current_actor_id(self) -> str:
@@ -281,6 +292,15 @@ class BunkerSession:
                 },
             )
         )
+        self._events.append(
+            PluginEvent(
+                event_type="bunker_vote_totals",
+                payload=cast(
+                    JsonObject,
+                    {"round_index": round_index, "totals": dict(totals)},
+                ),
+            )
+        )
         self._next_seq += 1
         self._public_log.append(
             cast(
@@ -306,17 +326,59 @@ class BunkerSession:
                 },
             )
         )
+        self._events.append(
+            PluginEvent(
+                event_type="bunker_elimination",
+                payload=cast(
+                    JsonObject,
+                    {
+                        "round_index": round_index,
+                        "eliminated": eliminated,
+                        "tie_break": tie_break,
+                        "reason": "vote",
+                    },
+                ),
+            )
+        )
         self._survivors.remove(eliminated)
 
         self._pending_ballots = []
         if len(self._survivors) == self._capacity:
             self._match_over = True
             self._voter_pointer = 0
+            self._events.append(
+                PluginEvent(
+                    event_type="match_end",
+                    payload=cast(
+                        JsonObject,
+                        {
+                            "admitted": list(self._survivors),
+                            "excluded": [
+                                cast(str, entry["target"])
+                                for entry in self._eliminations
+                            ],
+                            "completion_reason": "capacity_reached",
+                        },
+                    ),
+                )
+            )
         else:
             self._round_index += 1
             self._phase = "discuss"
             self._speaker_pointer = 0
             self._voter_pointer = 0
+            self._events.append(
+                PluginEvent(
+                    event_type="round_start",
+                    payload=cast(
+                        JsonObject,
+                        {
+                            "round_index": self._round_index,
+                            "survivors": list(self._survivors),
+                        },
+                    ),
+                )
+            )
 
         summary = f"{eliminated} was eliminated"
         if tie_break:
@@ -446,6 +508,38 @@ class BunkerSession:
         events = list(self._events)
         self._events.clear()
         return events
+
+    def get_result(self) -> GameResult:
+        eliminated_order = [cast(str, entry["target"]) for entry in self._eliminations]
+        completed = self._match_over
+        return GameResult(
+            completed=completed,
+            outcome=cast(
+                JsonObject,
+                {
+                    "admitted": list(self._survivors),
+                    "excluded": list(eliminated_order),
+                    "scenario": self._scenario,
+                    "capacity": self._capacity,
+                    "elimination_order": list(eliminated_order),
+                    "completion_reason": (
+                        "capacity_reached" if completed else "in_progress"
+                    ),
+                },
+            ),
+            metrics=cast(
+                GameMetrics,
+                {
+                    "elimination_rounds": len(self._eliminations),
+                    "speeches": self._speech_count,
+                    "ballots_cast": self._ballots_cast,
+                    "reveals_total": sum(self._reveal_counts.values()),
+                    "reveal_counts": dict(self._reveal_counts),
+                    "failed_turn_eliminations": self._failed_eliminations,
+                    "completed": completed,
+                },
+            ),
+        )
 
 
 class BunkerGame:
