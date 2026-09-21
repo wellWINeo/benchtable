@@ -17,13 +17,22 @@ from pydantic import ValidationError
 from benchtable.agents.protocol import Agent, AgentRequest
 from benchtable.contracts import (
     JsonObject,
+    JudgmentOutcome,
+    JudgmentRequest,
     MatchMemorySummary,
     ModelResponse,
     PluginEvent,
     ToolCall,
     Transition,
 )
-from benchtable.errors import InvalidActionError, ProviderError, RunError
+from benchtable.errors import (
+    InvalidActionError,
+    JudgeMalformedResponseError,
+    JudgeProviderError,
+    JudgeTimeoutError,
+    ProviderError,
+    RunError,
+)
 from benchtable.events import (
     EventWriter,
     redact_json_text,
@@ -31,6 +40,7 @@ from benchtable.events import (
     redact_value,
 )
 from benchtable.games.protocol import GamePlugin, GameSession
+from benchtable.judges.protocol import Judge, JudgeRequest
 from benchtable.memory import MatchMemory
 
 
@@ -112,6 +122,9 @@ class RunEngine:
         max_provider_retries: int = 2,
         max_memory_operations_per_turn: int = 4,
         progress_callback: Callable[[int, int, bool], None] | None = None,
+        judges: Mapping[str, Judge] | None = None,
+        judge_metadata: list[JsonObject] | None = None,
+        judge_max_retries: Mapping[str, int] | None = None,
     ) -> None:
         self._game = game
         self._agent = agent
@@ -134,6 +147,9 @@ class RunEngine:
                 "max_memory_operations_per_turn must be a non-negative integer"
             )
         self._max_memory_operations_per_turn = max_memory_operations_per_turn
+        self._judges: Mapping[str, Judge] = judges or {}
+        self._judge_metadata: list[JsonObject] = judge_metadata or []
+        self._judge_max_retries: Mapping[str, int] = judge_max_retries or {}
         self._actor_transcripts: dict[str, list[JsonObject]] = {}
         self._conversation_scope_id: str | None = None
 
@@ -219,6 +235,7 @@ class RunEngine:
                     "max_memory_operations_per_turn": (
                         self._max_memory_operations_per_turn
                     ),
+                    "judges": self._judge_metadata,
                 },
             ),
         )
@@ -240,6 +257,8 @@ class RunEngine:
             "completion_tokens": 0,
             "total_tokens": 0,
             "latency_seconds": 0.0,
+            "judge_calls": 0,
+            "judge_failures": 0,
         }
 
         writer.emit(
@@ -334,6 +353,68 @@ class RunEngine:
                 failure_reason="memory_initialization_failed",
             )
             return _MatchOutcome(False)
+
+        judge_dependencies = getattr(session, "required_judge_ids", None)
+        if callable(judge_dependencies):
+            try:
+                resolved_judges: object = judge_dependencies()
+            except Exception as exc:
+                writer.emit(
+                    "engine_error",
+                    {"phase": "judge_dependency", "error": str(exc)},
+                    match_id=match_id,
+                )
+                self._emit_match_end(
+                    writer,
+                    match_id,
+                    metrics,
+                    completed=False,
+                    failure_reason="judge_dependency_failed",
+                )
+                return _MatchOutcome(False)
+            if type(resolved_judges) is not list or not all(
+                type(entry) is str for entry in cast("list[object]", resolved_judges)
+            ):
+                writer.emit(
+                    "engine_error",
+                    {
+                        "phase": "judge_dependency",
+                        "error": "required_judge_ids must return a list of strings",
+                    },
+                    match_id=match_id,
+                )
+                self._emit_match_end(
+                    writer,
+                    match_id,
+                    metrics,
+                    completed=False,
+                    failure_reason="judge_dependency_failed",
+                )
+                return _MatchOutcome(False)
+            missing_judges = sorted(
+                {
+                    judge_id
+                    for judge_id in cast("list[str]", resolved_judges)
+                    if judge_id not in self._judges
+                }
+            )
+            if missing_judges:
+                writer.emit(
+                    "engine_error",
+                    cast(
+                        JsonObject,
+                        {"phase": "judge_dependency", "missing": missing_judges},
+                    ),
+                    match_id=match_id,
+                )
+                self._emit_match_end(
+                    writer,
+                    match_id,
+                    metrics,
+                    completed=False,
+                    failure_reason="judge_dependency_missing",
+                )
+                return _MatchOutcome(False)
 
         try:
             self._drain_plugin_events(
@@ -753,14 +834,46 @@ class RunEngine:
                 invalid_attempts = action_response.invalid_attempts
                 continue
 
+            judgment_request_fn = cast(
+                Callable[[str, str, JsonObject], object] | None,
+                getattr(session, "judgment_request", None),
+            )
+            apply_judged_fn = cast(
+                Callable[[str, str, JsonObject, JudgmentOutcome | None], Transition]
+                | None,
+                getattr(session, "apply_judged_action", None),
+            )
+            judgment: JudgmentOutcome | None = None
+
             transcript.append(self._assistant_tool_message(response))
 
             try:
-                transition = session.apply_action(
-                    actor_id,
-                    tool_call.name,
-                    tool_call.arguments,
-                )
+                if judgment_request_fn is not None and apply_judged_fn is not None:
+                    session_judgment = judgment_request_fn(
+                        actor_id, tool_call.name, tool_call.arguments
+                    )
+                    if isinstance(session_judgment, JudgmentRequest):
+                        judgment = await self._run_judgment(
+                            writer,
+                            session_judgment.judge_id,
+                            session_judgment,
+                            match_id,
+                            turn_idx,
+                            actor_id,
+                            metrics,
+                        )
+                    transition = apply_judged_fn(
+                        actor_id,
+                        tool_call.name,
+                        tool_call.arguments,
+                        judgment,
+                    )
+                else:
+                    transition = session.apply_action(
+                        actor_id,
+                        tool_call.name,
+                        tool_call.arguments,
+                    )
             except InvalidActionError as exc:
                 self._emit_validation_failure(
                     writer,
@@ -1176,6 +1289,158 @@ class RunEngine:
                 )
             )
         return None
+
+    async def _run_judgment(
+        self,
+        writer: EventWriter,
+        judge_id: str,
+        request: JudgmentRequest,
+        match_id: str,
+        turn_idx: int,
+        actor_id: str,
+        metrics: dict[str, Any],
+    ) -> JudgmentOutcome:
+        """Invoke one named judge with retry accounting and event logging."""
+        judge = self._judges.get(judge_id)
+        if judge is None:
+            metrics["judge_failures"] += 1
+            writer.emit(
+                "judge_error",
+                {
+                    "judge_id": judge_id,
+                    "judgment_kind": request.judgment_kind,
+                    "failure_reason": "judge_unresolved",
+                    "error": f"No judge configured with id {judge_id!r}",
+                    "attempt": 1,
+                },
+                match_id=match_id,
+                turn_index=turn_idx,
+                actor_id=actor_id,
+            )
+            return JudgmentOutcome(ok=False, failure_reason="judge_unresolved")
+
+        attempts = int(self._judge_max_retries.get(judge_id, 0)) + 1
+        last_reason = "provider_error"
+        for attempt in range(1, attempts + 1):
+            writer.emit(
+                "judge_request",
+                {
+                    "judge_id": judge_id,
+                    "judgment_kind": request.judgment_kind,
+                    "payload": request.payload,
+                    "attempt": attempt,
+                },
+                match_id=match_id,
+                turn_index=turn_idx,
+                actor_id=actor_id,
+            )
+            started = time.monotonic()
+            try:
+                decision = await judge.decide(
+                    JudgeRequest(
+                        judgment_kind=request.judgment_kind,
+                        payload=request.payload,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except JudgeTimeoutError as exc:
+                last_reason = "timeout"
+                error_payload: dict[str, Any] = {
+                    "judge_id": judge_id,
+                    "judgment_kind": request.judgment_kind,
+                    "failure_reason": last_reason,
+                    "error": str(exc),
+                    "attempt": attempt,
+                }
+            except JudgeMalformedResponseError as exc:
+                last_reason = "malformed_response"
+                error_payload = {
+                    "judge_id": judge_id,
+                    "judgment_kind": request.judgment_kind,
+                    "failure_reason": last_reason,
+                    "error": str(exc),
+                    "attempt": attempt,
+                }
+                raw_response = self._judge_raw_value(exc.raw_provider_response)
+                if raw_response is not None:
+                    error_payload["raw_provider_response"] = raw_response
+            except JudgeProviderError as exc:
+                last_reason = "provider_error"
+                error_payload = {
+                    "judge_id": judge_id,
+                    "judgment_kind": request.judgment_kind,
+                    "failure_reason": last_reason,
+                    "error": str(exc),
+                    "attempt": attempt,
+                    "provider": exc.provider,
+                    "model": exc.model,
+                }
+                raw_request = self._judge_raw_value(exc.raw_provider_request)
+                raw_response = self._judge_raw_value(exc.raw_provider_response)
+                if raw_request is not None:
+                    error_payload["raw_provider_request"] = raw_request
+                if raw_response is not None:
+                    error_payload["raw_provider_response"] = raw_response
+            else:
+                latency = time.monotonic() - started
+                metrics["latency_seconds"] += latency
+                metrics["judge_calls"] += 1
+                writer.emit(
+                    "judge_response",
+                    {
+                        "judge_id": judge_id,
+                        "judgment_kind": request.judgment_kind,
+                        "decision": decision.decision,
+                        "model": decision.model,
+                        "usage": decision.usage,
+                        "latency_ms": latency * 1000.0,
+                        "raw_provider_request": self._judge_raw_value(
+                            decision.raw_provider_request
+                        ),
+                        "raw_provider_response": self._judge_raw_value(
+                            decision.raw_provider_response
+                        ),
+                    },
+                    match_id=match_id,
+                    turn_index=turn_idx,
+                    actor_id=actor_id,
+                )
+                return JudgmentOutcome(
+                    ok=True,
+                    decision=decision.decision,
+                    model=decision.model,
+                    usage=decision.usage,
+                    latency_ms=latency * 1000.0,
+                )
+            metrics["judge_failures"] += 1
+            writer.emit(
+                "judge_error",
+                cast(JsonObject, error_payload),
+                match_id=match_id,
+                turn_index=turn_idx,
+                actor_id=actor_id,
+            )
+        return JudgmentOutcome(ok=False, failure_reason=last_reason)
+
+    @staticmethod
+    def _judge_raw_value(value: object) -> JsonObject | None:
+        """Return a JSON-compatible form of a raw provider payload."""
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            try:
+                json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError):
+                pass
+            else:
+                return cast(JsonObject, value)
+        try:
+            return {
+                "repr": redact_text(redact_json_text(json.dumps(value, default=str)))
+            }
+        except (TypeError, ValueError):
+            return {"repr": "<unserializable>"}
 
     @staticmethod
     def _memory_context(session: GameSession, fallback_turn: int) -> tuple[int, int]:

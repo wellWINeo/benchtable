@@ -7,6 +7,8 @@ from typing import Protocol, runtime_checkable
 from benchtable.contracts import (
     GameResult,
     JsonObject,
+    JudgmentOutcome,
+    JudgmentRequest,
     MatchMemorySummary,
     Observation,
     PluginEvent,
@@ -54,6 +56,30 @@ class PluginEventSession(Protocol):
     """Optional capability exposing typed plugin lifecycle events."""
 
     def drain_hand_events(self) -> list[PluginEvent]: ...
+
+
+@runtime_checkable
+class JudgedActionSession(Protocol):
+    """Optional capability requesting pre-action judgments."""
+
+    def judgment_request(
+        self, actor_id: str, tool_name: str, arguments: JsonObject
+    ) -> JudgmentRequest | None: ...
+
+    def apply_judged_action(
+        self,
+        actor_id: str,
+        tool_name: str,
+        arguments: JsonObject,
+        judgment: JudgmentOutcome | None,
+    ) -> Transition: ...
+
+
+@runtime_checkable
+class JudgeDependencySession(Protocol):
+    """Optional capability declaring judge IDs required by a session."""
+
+    def required_judge_ids(self) -> list[str]: ...
 
 
 @runtime_checkable
