@@ -443,7 +443,8 @@ def test_plugin_events_lifecycle_and_public_safety() -> None:
     assert types.count("bunker_reveal") == 0
     assert types.count("bunker_vote_totals") == 2
     assert types.count("bunker_elimination") == 2
-    assert types[-1] == "match_end"
+    assert types[-1] == "bunker_match_end"
+    assert "match_end" not in types  # only the bunker-prefixed name
 
     round_start = events[0]
     assert round_start.payload["round_index"] == 0
@@ -462,6 +463,7 @@ def test_plugin_events_lifecycle_and_public_safety() -> None:
     assert eliminations[1].payload["eliminated"] == "p3"
 
     match_end = events[-1]
+    assert match_end.event_type == "bunker_match_end"
     assert match_end.payload["admitted"] == ["p1", "p4"]
     assert match_end.payload["excluded"] == ["p2", "p3"]
     assert match_end.payload["completion_reason"] == "capacity_reached"
@@ -482,3 +484,112 @@ def test_plugin_events_lifecycle_and_public_safety() -> None:
         blob = str(event.payload)
         for value in hidden:
             assert value not in blob, f"dossier value {value!r} leaked into trace"
+
+
+def test_failed_turn_during_discussion_eliminates_and_advances_round() -> None:
+    session = _session()
+    _speak(session, "p1")
+    _speak(session, "p2")
+
+    transition = session.handle_failed_turn("p3", "invalid_attempts_exhausted")
+
+    assert transition is not None
+    assert session._survivors == ["p1", "p2", "p4"]
+    assert session._round_index == 1
+    assert session._phase == "discuss"
+    assert session._speaker_pointer == 0
+    assert session.current_actor_id == "p1"
+    assert session._eliminations == [
+        {
+            "round_index": 0,
+            "target": "p3",
+            "reason": "failed_turn_invalid_attempts_exhausted",
+            "tie_break": False,
+        }
+    ]
+    assert "p3 eliminated (no tie break)" in session.get_observation("p1").text
+
+
+def test_failed_turn_during_ballot_discards_partial_ballots() -> None:
+    session = _session()
+    _run_discussion(session, PLAYERS)
+    _vote(session, "p1", "p3")  # one partial ballot is collected
+    assert session._ballots_cast == 1
+
+    transition = session.handle_failed_turn("p2", "provider_retries_exhausted")
+
+    assert transition is not None
+    assert session._pending_ballots == []
+    assert session._round_index == 1
+    assert session._phase == "discuss"
+    assert session.current_actor_id == "p1"
+    assert session._eliminations == [
+        {
+            "round_index": 0,
+            "target": "p2",
+            "reason": "failed_turn_provider_retries_exhausted",
+            "tie_break": False,
+        }
+    ]
+
+    # The partial ballot never becomes a fabricated vote: no vote totals in
+    # any observation, and no bunker_vote_totals event in the drained queue.
+    view = session.get_observation("p1")
+    assert "vote totals" not in view.text
+    events = session.drain_hand_events()
+    assert all(event.event_type != "bunker_vote_totals" for event in events)
+    assert any(
+        event.event_type == "bunker_elimination"
+        and event.payload["eliminated"] == "p2"
+        and event.payload["reason"] == "failed_turn_provider_retries_exhausted"
+        for event in events
+    )
+
+
+def test_failed_turn_reaching_capacity_completes_match() -> None:
+    session = BunkerSession(
+        players=list(PLAYERS), scenario="sealed shelter", shelter_capacity=3, seed=9
+    )
+
+    transition = session.handle_failed_turn("p4", "invalid_attempts_exhausted")
+
+    assert transition is not None
+    assert session.is_terminal
+    result = session.get_result()
+    assert result.completed is True
+    assert result.outcome["completion_reason"] == "capacity_reached"
+    assert result.outcome["admitted"] == ["p1", "p2", "p3"]
+    assert result.outcome["excluded"] == ["p4"]
+    assert result.metrics["failed_turn_eliminations"] == 1
+
+    events = session.drain_hand_events()
+    end_events = [e for e in events if e.event_type == "bunker_match_end"]
+    assert len(end_events) == 1
+    assert end_events[0].payload["completion_reason"] == "capacity_reached"
+    assert end_events[0].payload["admitted"] == ["p1", "p2", "p3"]
+
+
+def test_failed_turn_transition_is_public_safe() -> None:
+    session = _session()
+    _speak(session, "p1")
+    hidden = _dossier_values(session.get_observation("p2").text)
+
+    transition = session.handle_failed_turn("p2", "invalid_attempts_exhausted")
+
+    assert transition is not None
+    assert transition.summary == (
+        "round 1: p2 eliminated by failed turn (invalid_attempts_exhausted)"
+    )
+    for value in hidden.values():
+        assert value not in transition.summary
+        assert value not in str(transition.metrics)
+
+
+def test_failed_turn_for_eliminated_actor_returns_none() -> None:
+    session = _session()
+    _speak(session, "p1")
+    session.handle_failed_turn("p2", "invalid_attempts_exhausted")
+
+    assert session.handle_failed_turn("p2", "provider_retries_exhausted") is None
+    assert session.get_result().metrics["elimination_rounds"] == 1
+    assert session._survivors == ["p1", "p3", "p4"]

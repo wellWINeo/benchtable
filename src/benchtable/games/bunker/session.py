@@ -301,6 +301,27 @@ class BunkerSession:
                 ),
             )
         )
+        self._eliminate(eliminated, reason="vote", tie_break=tie_break)
+
+        summary = f"{eliminated} was eliminated"
+        if tie_break:
+            summary += " after a tie break"
+        return Transition(
+            summary=summary,
+            metrics=cast(
+                GameMetrics,
+                {
+                    "round_index": round_index,
+                    "eliminated": eliminated,
+                    "tie_break": tie_break,
+                    "survivors": len(self._survivors),
+                },
+            ),
+        )
+
+    def _eliminate(self, player: str, *, reason: str, tie_break: bool) -> None:
+        """Shared elimination path for ballot closures and failed turns."""
+        round_index = self._round_index
         self._next_seq += 1
         self._public_log.append(
             cast(
@@ -309,9 +330,9 @@ class BunkerSession:
                     "seq": self._next_seq,
                     "kind": "elimination",
                     "round_index": round_index,
-                    "eliminated": eliminated,
+                    "eliminated": player,
                     "tie_break": tie_break,
-                    "reason": "vote",
+                    "reason": reason,
                 },
             )
         )
@@ -320,8 +341,8 @@ class BunkerSession:
                 JsonObject,
                 {
                     "round_index": round_index,
-                    "target": eliminated,
-                    "reason": "vote",
+                    "target": player,
+                    "reason": reason,
                     "tie_break": tie_break,
                 },
             )
@@ -333,22 +354,23 @@ class BunkerSession:
                     JsonObject,
                     {
                         "round_index": round_index,
-                        "eliminated": eliminated,
+                        "eliminated": player,
                         "tie_break": tie_break,
-                        "reason": "vote",
+                        "reason": reason,
                     },
                 ),
             )
         )
-        self._survivors.remove(eliminated)
-
+        if reason.startswith("failed_turn_"):
+            self._failed_eliminations += 1
+        self._survivors.remove(player)
         self._pending_ballots = []
         if len(self._survivors) == self._capacity:
             self._match_over = True
             self._voter_pointer = 0
             self._events.append(
                 PluginEvent(
-                    event_type="match_end",
+                    event_type="bunker_match_end",
                     payload=cast(
                         JsonObject,
                         {
@@ -380,19 +402,24 @@ class BunkerSession:
                 )
             )
 
-        summary = f"{eliminated} was eliminated"
-        if tie_break:
-            summary += " after a tie break"
+    def handle_failed_turn(self, actor_id: str, reason: str) -> Transition | None:
+        """Eliminate the failed player; the failure consumes this round."""
+        if actor_id not in self._survivors:
+            return None
+        round_index = self._round_index
+        self._eliminate(
+            actor_id,
+            reason=f"failed_turn_{reason}",
+            tie_break=False,
+        )
         return Transition(
-            summary=summary,
+            summary=(
+                f"round {round_index + 1}: {actor_id} eliminated "
+                f"by failed turn ({reason})"
+            ),
             metrics=cast(
                 GameMetrics,
-                {
-                    "round_index": round_index,
-                    "eliminated": eliminated,
-                    "tie_break": tie_break,
-                    "survivors": len(self._survivors),
-                },
+                {"reason": reason, "eliminated": actor_id},
             ),
         )
 
