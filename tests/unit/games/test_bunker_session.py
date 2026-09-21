@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from pydantic import ValidationError
 
 from benchtable.errors import InvalidActionError
 from benchtable.games.bunker.session import BunkerGame, BunkerSession
@@ -59,12 +60,15 @@ def test_dossiers_deterministic_for_seed_and_private() -> None:
     )
     assert differing, "different seeds must eventually assign different dossiers"
 
+    dossiers = {
+        actor_id: _dossier_values(first.get_observation(actor_id).text)
+        for actor_id in PLAYERS
+    }
     for actor_id in PLAYERS:
-        for other_id in PLAYERS:
-            if actor_id == other_id:
-                continue
-            own = set(_dossier_values(first.get_observation(actor_id).text).values())
-            assert len(own) == 4
+        assert len(set(dossiers[actor_id].values())) == 4
+    assert dossiers["p1"] != dossiers["p2"], (
+        "pools allow cross-actor dossier differences"
+    )
 
 
 def test_delta_delivery_and_no_redelivery() -> None:
@@ -137,6 +141,15 @@ def test_speak_validation_rejects_bad_actions() -> None:
             {"target_id": "p3"},
         )
 
+    _speak(session, "p2")
+    _speak(session, "p3")
+    _speak(session, "p4")
+    assert session.get_observation("p1").metadata["phase"] == "ballot"
+    with pytest.raises(InvalidActionError):
+        _speak(session, "p1", "speaking during ballots")
+    with pytest.raises(InvalidActionError):
+        session.apply_action("p1", "bunker_vote_eliminate", {"target_id": "p2"})
+
 
 def test_rotation_and_ballot_phase_switch() -> None:
     session = _session()
@@ -188,7 +201,7 @@ def test_plugin_factory_contract() -> None:
     }
     assert plugin.player_ids_from_config(game_config) == PLAYERS
     plugin.validate_config(game_config)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         plugin.validate_config({"players": PLAYERS})
 
     prompt = plugin.system_prompt("p1")
