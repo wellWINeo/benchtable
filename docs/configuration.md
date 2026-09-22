@@ -48,8 +48,9 @@ max_completion_tokens = 512                 # Optional completion-token limit.
 
 All keys in `[run]` other than `game` and `matches` have defaults. Integer
 fields below are strict integers: TOML booleans, strings, and floating-point
-values are rejected rather than coerced. The top level accepts only `run` and
-`agents`; unknown top-level keys and unknown `[run]` keys are rejected.
+values are rejected rather than coerced. The top level accepts only `run`,
+`agents`, and `judges`; unknown top-level keys and unknown `[run]` keys are
+rejected.
 
 | Key | Type, default, and constraints | Effect |
 | --- | --- | --- |
@@ -105,6 +106,29 @@ There are no other generic generation settings. In particular, `max_tokens`,
 temperature, top-p, and provider-specific settings are not accepted generic
 agent keys; use only `max_completion_tokens` where supported by this schema.
 
+## `[[judges]]` Entries
+
+Judges are optional typed-decision models used by games that request
+pre-action judgments. The top level accepts any number of `[[judges]]`
+tables; judge IDs must be unique. Unknown judge keys are rejected.
+
+| Key | Type, default, and constraints | Effect |
+| --- | --- | --- |
+| `id` | Required strict nonblank string. | Names the judge; games reference it from game configuration (for example `judge_id`). |
+| `adapter` | One of `"openrouter_decisions"`; default `"openrouter_decisions"`. | Selects the judge adapter. |
+| `model` | Required strict nonblank string. | Pinned model ID sent to the adapter. Rolling aliases (any ID starting with `~`) are rejected so a threshold stays calibrated against one model. |
+| `base_url` | Optional strict nonblank string. | Overrides the Decisions endpoint; default `https://openrouter.ai/api/alpha/decisions`. |
+| `api_key_env` | Strict nonblank string; default `"OPENROUTER_API_KEY"`. | Names the environment variable containing the credential. |
+| `timeout` | Optional finite positive number. | Per-request timeout in seconds; the adapter default is `30` when omitted. |
+| `max_retries` | Strict integer, at least `0`; default `2`. | Engine-owned retry budget: each judgment is attempted at most `max_retries + 1` times. |
+
+Like agents, judges read their credential from the environment at
+construction; `benchtable run` exits before any provider request when the
+named variable is missing or blank, and no literal key is ever accepted or
+recorded. The first-party Spyfall plugin is the current consumer; see its
+section below and docs/spyfall-judge-calibration.md before selecting a
+leak threshold.
+
 ## Plugin Configuration And Agent Mapping
 
 Generic validation does not define game rules. Before constructing agents, the
@@ -119,6 +143,11 @@ When more than one `[[agents]]` entry is configured, or when a plugin declares
 resolved actor IDs, with no missing or extra IDs; each turn is dispatched to
 the matching actor ID. Otherwise, one configured agent is the shared fallback
 for every actor and its ID need not match an actor ID.
+
+Plugins may also expose an optional `min_max_turns(game_config)` hook. When
+present, the CLI rejects any configuration whose `run.max_turns` is below the
+returned minimum before constructing agents. A missing or non-integer return
+is a plugin error; a plugin without the hook is unconstrained.
 
 ## Provider Examples
 
@@ -187,3 +216,56 @@ For example, these poker player IDs require exactly two agent entries with
 [run.game_config]
 players = ["player-1", "player-2"]
 ```
+
+## Spyfall `[run.game_config]`
+
+The first-party `spyfall` plugin requires the keys below. It rejects unknown
+keys, coerced values, and duplicate player or location names. Spyfall has
+`requires_exact_agent_ids = true`: configure one `[[agents]]` entry for every
+string in `players`, and one `[[judges]]` entry whose `id` matches
+`judge_id`.
+
+```toml
+[[judges]]
+id = "spyfall-leak-judge"
+model = "typesafe/jev-1.13"
+api_key_env = "OPENROUTER_API_KEY"
+
+[run]
+game = "spyfall"
+matches = 1
+seed = 20260920
+max_turns = 135
+
+[run.game_config]
+players = ["player-1", "player-2", "player-3"]
+rounds_per_match = 5
+question_rounds = 3
+accusation_vote_threshold = 0.75
+judge_id = "spyfall-leak-judge"
+judge_leak_threshold = 0.85
+
+[[run.game_config.locations]]
+name = "airport"
+
+[[run.game_config.locations]]
+name = "underwater research station"
+```
+
+| Key | Type, default, and constraints | Effect |
+| --- | --- | --- |
+| `players` | Required list of strict nonblank strings; `3` through `8` entries, unique. | The round roster and the required agent IDs. Each round's Spy and location are seeded from the match seed. |
+| `rounds_per_match` | Strict integer, at least `1`. | Rounds played per match; every round awards one point to each player on its winning side. |
+| `question_rounds` | Strict integer, at least `1`. | Complete questioner rotations per round. With three players and `question_rounds = 3`, a round holds up to nine question/answer exchanges. |
+| `accusation_vote_threshold` | Strict number in `(0, 1]`. | Conviction needs `ceil(threshold * eligible_voters)` yes votes; the accused is not eligible. |
+| `judge_id` | Required strict nonblank string. | The `[[judges]]` entry consulted for every public question and answer. A missing match is a configuration failure. |
+| `judge_leak_threshold` | Strict number in `[0, 1]`. | A normalized leak probability at or above this value ends the round in favor of the Spy. Set it explicitly; see docs/spyfall-judge-calibration.md. |
+| `locations` | Required list of tables, each with a unique nonblank `name`. | The location catalog the session selects from each round. The engine never selects a location. |
+
+A normal question/answer slot costs two engine turns and a non-convicting
+accusation consumes one whole slot at `N` turns, so a match needs at most
+`rounds_per_match * players^2 * question_rounds` turns. `run.max_turns` must
+be at least that value and the plugin enforces it: with three players, five
+rounds, and three question rotations the minimum is `5 * 3^2 * 3 = 135`, and
+`benchtable run` rejects smaller values before any provider request. Judge
+calls and finalization calls add provider requests but not engine turns.

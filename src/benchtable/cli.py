@@ -11,10 +11,11 @@ from uuid import uuid4
 import typer
 
 from benchtable.agents.protocol import Agent
-from benchtable.config import AgentConfig, load_config
+from benchtable.config import AgentConfig, JudgeConfig, load_config
 from benchtable.contracts import JsonObject
 from benchtable.events import redact_value
 from benchtable.games.registry import GameRegistry
+from benchtable.judges.protocol import Judge
 
 app = typer.Typer(
     name="benchtable",
@@ -25,6 +26,8 @@ app = typer.Typer(
 _registry: GameRegistry | None = None
 AgentFactory = Callable[[AgentConfig], Agent]
 _agent_factory: AgentFactory | None = None
+JudgeFactory = Callable[[JudgeConfig], Judge]
+_judge_factory: JudgeFactory | None = None
 
 
 def _safe_error_message(error: BaseException) -> str:
@@ -59,6 +62,18 @@ def set_agent_factory(factory: AgentFactory | None) -> None:
     """Override agent construction (for testing)."""
     global _agent_factory
     _agent_factory = factory
+
+
+def set_judge_factory(factory: JudgeFactory | None) -> None:
+    """Override judge construction (for testing)."""
+    global _judge_factory
+    _judge_factory = factory
+
+
+def _default_judge_factory(judge_config: JudgeConfig) -> Judge:
+    from benchtable.judges import create_judge
+
+    return create_judge(judge_config)
 
 
 def _default_agent_factory(agent_config: AgentConfig) -> Agent:
@@ -166,6 +181,19 @@ def run_experiment(
         raise typer.Exit(code=1) from exc
 
     try:
+        min_turns = registry.min_max_turns(cfg.run.game, cfg.run.game_config)
+    except Exception as exc:
+        typer.echo(f"Plugin error: {_safe_error_message(exc)}", err=True)
+        raise typer.Exit(code=1) from exc
+    if min_turns is not None and cfg.run.max_turns < min_turns:
+        typer.echo(
+            f"Configuration error: run.max_turns={cfg.run.max_turns} is below the "
+            f"minimum {min_turns} required by game '{cfg.run.game}'",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
         actor_ids = set(registry.resolve_player_ids(cfg.run.game, cfg.run.game_config))
     except Exception as exc:
         typer.echo(f"Game configuration error: {_safe_error_message(exc)}", err=True)
@@ -206,6 +234,19 @@ def run_experiment(
             raise typer.Exit(code=1) from exc
         agent_metadata.append(cast(JsonObject, agent_cfg.model_dump(mode="json")))
 
+    judge_factory = _judge_factory or _default_judge_factory
+    judges: dict[str, Judge] = {}
+    judge_metadata: list[JsonObject] = []
+    judge_max_retries: dict[str, int] = {}
+    for judge_cfg in cfg.judges:
+        try:
+            judges[judge_cfg.id] = judge_factory(judge_cfg)
+        except Exception as exc:
+            typer.echo(f"Judge error: {_safe_error_message(exc)}", err=True)
+            raise typer.Exit(code=1) from exc
+        judge_metadata.append(cast(JsonObject, judge_cfg.model_dump(mode="json")))
+        judge_max_retries[judge_cfg.id] = judge_cfg.max_retries
+
     try:
         output.mkdir(parents=True, exist_ok=True)
         typer.echo(f"Running {cfg.run.matches} match(es)...", err=True)
@@ -228,6 +269,9 @@ def run_experiment(
             max_provider_retries=cfg.run.max_provider_retries,
             max_memory_operations_per_turn=cfg.run.max_memory_operations_per_turn,
             progress_callback=_report_match_progress,
+            judges=judges or None,
+            judge_metadata=judge_metadata or None,
+            judge_max_retries=judge_max_retries or None,
         )
         result = asyncio.run(engine.run())
     except Exception as exc:

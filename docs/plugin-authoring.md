@@ -218,13 +218,113 @@ call. Finalization must contain assistant text or a finish reason. A
 finalization response containing any tool call fails immediately and is not
 retried.
 
+### Judged Actions
+
+A game that needs a typed model decision before an action mutates state (a
+leak check, a moderation gate) implements two session methods. Both must be
+present; the engine treats the pair as one opt-in capability:
+
+```python
+from benchtable.contracts import JudgmentOutcome, JudgmentRequest
+
+
+class MySession:
+    def judgment_request(
+        self, actor_id: str, tool_name: str, arguments: JsonObject
+    ) -> JudgmentRequest | None:
+        """Validate fully, then return a request or None."""
+
+    def apply_judged_action(
+        self,
+        actor_id: str,
+        tool_name: str,
+        arguments: JsonObject,
+        judgment: JudgmentOutcome | None,
+    ) -> Transition:
+        """Apply the action, interpreting the normalized judgment."""
+```
+
+The engine performs its ordinary shape validation first. For each candidate
+action it then calls `judgment_request`; validate the action completely there
+and raise `InvalidActionError` for anything illegal, so judge calls are never
+spent on rejectable actions. Return a `JudgmentRequest(judge_id,
+judgment_kind, payload)` only when this action needs a judgment; the payload
+is a minimal JSON object and may contain game secrets. Return `None` for
+actions that need none. The engine then calls `apply_judged_action` with
+`judgment=None` when no judgment was requested, or with an outcome where:
+
+- `ok=True` carries `decision` (the adapter's normalized JSON decision),
+  `model`, `usage`, and `latency_ms`.
+- `ok=False` carries `failure_reason` (`"provider_error"`, `"timeout"`,
+  `"malformed_response"`, or `"judge_unresolved"`) and no decision.
+
+The engine never interprets the decision; policy is yours. A judge failure is
+reported by the engine but is otherwise invisible to it: failing open
+(proceed without an award), failing closed, or ending the round is game
+policy. An `InvalidActionError` raised by either method flows through the
+normal invalid-action retry path.
+
+The engine invokes the judge before mutating session state and owns retry
+accounting: each judge is attempted `max_retries + 1` times from its
+`[[judges]]` configuration. Every attempt is traced:
+
+- `judge_request` — `{judge_id, judgment_kind, payload, attempt}` including
+  the full payload.
+- `judge_response` — the normalized decision plus `model`, `usage`,
+  `latency_ms`, and the adapter's raw provider request/response payloads.
+- `judge_error` — the typed failure reason, message, attempt, provider/model
+  when available, and raw provider payloads when the exception carries them.
+
+The run metrics gain `judge_calls` and `judge_failures`.
+
+A session that always needs specific judges declares them and gets a preflight
+guarantee:
+
+```python
+class MySession:
+    def required_judge_ids(self) -> list[str]:
+        return ["my-leak-judge"]
+```
+
+Immediately after session creation and before any actor or judge provider
+request, the engine resolves every declared ID against the configured judges.
+A missing judge fails the match with `failure_reason
+judge_dependency_missing`; it is a configuration failure, never a fail-open
+judge failure.
+
+Judges implement the `Judge` protocol (`benchtable.judges.protocol`): a
+`judge_id` plus an async `decide(JudgeRequest) -> JudgmentDecision`. The CLI
+builds them from `[[judges]]` configuration through
+`benchtable.judges.create_judge`. The first concrete adapter is
+`OpenRouterDecisionsJudge` for the pinned `typesafe/jev-1.13` model via
+OpenRouter's System One/Decisions endpoint; it never rewrites model IDs and
+never falls back to another model.
+
+### Minimum Turn Budget
+
+Plugins whose safe upper bound on engine turns is computable may expose
+`min_max_turns(game_config) -> int`. The registry helper
+`GameRegistry.min_max_turns` validates the return value (an integer of at
+least `1`) and `benchtable run` rejects any configuration whose `run.max_turns`
+is below it before constructing agents. Plugins without the hook are
+unaffected. See the Spyfall configuration section in
+docs/configuration.md for a worked example.
+
 ### Failed Turns
 
-`handle_failed_turn` is called when the model exhausts its invalid-action
-budget. Return `None` to let the engine end the match as failed, or return a
-`Transition` to apply a game-specific recovery. A nonterminal recovery lets
-the engine continue the match; a terminal recovery is completed only when the
-session returns a completed result.
+`handle_failed_turn(actor_id, reason)` is called for game-attributable,
+actor-scoped turn failures. The routed set is `invalid_attempts_exhausted`,
+`memory_budget_exhausted`, `finalization_tool_calls`,
+`finalization_empty_response`, and `provider_retries_exhausted` (the last one
+also covers request timeouts). Return `None` to let the engine end the match
+as failed, or return a `Transition` to apply a game-specific recovery. A
+nonterminal recovery lets the engine continue the match; a terminal recovery
+is completed only when the session returns a completed result.
+
+Configuration and setup failures, plugin or engine faults (`missing_agent`,
+`agent_failure`, `turn_setup_failed`, `action_application_failed`,
+`reserved_tool_name_collision`), engine max-turn exhaustion, and cancellation
+are never routed: they retain explicit failed-match or cancellation behavior.
 
 ### No Raw State Exposure
 
@@ -252,6 +352,8 @@ The engine records these events for each turn:
 - `model_response` - the raw and normalized model output
 - `validation` - whether the action was valid
 - `transition` - your plugin-supplied summary and metrics
+- `judge_request` / `judge_response` / `judge_error` - judged-action
+  invocations, including raw provider payloads (see Judged Actions)
 
 Credential-shaped fields are redacted before writing.
 

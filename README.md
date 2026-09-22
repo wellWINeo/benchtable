@@ -126,3 +126,16 @@ not paired with actions. Each accepted action receives a public transition
 tool result followed by exactly one tool-free finalization call. Finalization
 must contain assistant text or a finish reason; a finalization tool call fails
 immediately without retry.
+
+## Spyfall
+
+Benchtable includes a first-party Spyfall plugin: one hidden Spy per round,
+structured public questions and answers, secret accusation ballots, and a
+real LLM leak judge (the pinned `typesafe/jev-1.13` model through OpenRouter's
+Decisions endpoint) that ends the round in the Spy's favor when a public
+message discloses the secret location. Judge failures fail open and are
+traced explicitly. Configuration (including `[[judges]]` entries and the
+enforced minimum `max_turns`) is documented in
+[docs/configuration.md](docs/configuration.md), and the judge calibration
+protocol plus its privacy implications are documented in
+[docs/spyfall-judge-calibration.md](docs/spyfall-judge-calibration.md).

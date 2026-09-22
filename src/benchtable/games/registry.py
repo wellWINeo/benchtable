@@ -83,6 +83,26 @@ class GameRegistry:
                 f"Plugin '{name}' exact-agent capability could not be read: {exc}"
             ) from exc
 
+    def min_max_turns(self, name: str, game_config: JsonObject) -> int | None:
+        """Return the plugin-declared minimum ``run.max_turns`` if declared."""
+        plugin = self.load(name)
+        hook = getattr(plugin, "min_max_turns", None)
+        if hook is None:
+            return None
+        if not callable(hook):
+            raise PluginError(f"Plugin '{name}' min_max_turns must be callable")
+        try:
+            value = cast(Callable[[JsonObject], object], hook)(game_config)
+        except Exception as exc:
+            raise PluginError(
+                f"Plugin '{name}' min_max_turns could not be read: {exc}"
+            ) from exc
+        if type(value) is not int or value < 1:
+            raise PluginError(
+                f"Plugin '{name}' min_max_turns must return an integer >= 1"
+            )
+        return value
+
     def discover(self) -> None:
         """Discover plugins from the benchtable.games entry-point group."""
         try:

@@ -8,8 +8,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from benchtable.config import AgentConfig, RunConfig, load_config
+from benchtable.config import AgentConfig, ExperimentConfig, RunConfig, load_config
 from benchtable.errors import ConfigurationError
+
+
+def load_config_from_dict(data: dict[str, object]) -> ExperimentConfig:
+    """Validate an in-memory configuration mapping."""
+    return ExperimentConfig.model_validate(data)
 
 
 class TestLoadConfig:
@@ -872,3 +877,53 @@ class TestLoadConfig:
 
         with pytest.raises(ConfigurationError):
             load_config(cfg_path)
+
+
+class TestJudgeConfig:
+    def _base(self) -> dict[str, object]:
+        return {
+            "run": {"game": "spyfall", "matches": 1},
+            "agents": [{"id": "player-1", "model": "m"}],
+            "judges": [
+                {
+                    "id": "spyfall-leak-judge",
+                    "model": "typesafe/jev-1.13",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                }
+            ],
+        }
+
+    def test_judge_defaults(self) -> None:
+        cfg = load_config_from_dict(self._base())
+        judge = cfg.judges[0]
+        assert judge.adapter == "openrouter_decisions"
+        assert judge.max_retries == 2
+        assert judge.base_url is None
+
+    def test_judge_rejects_rolling_alias(self) -> None:
+        data = self._base()
+        data["judges"][0]["model"] = "~typesafe/jev-latest"
+        with pytest.raises(Exception):
+            load_config_from_dict(data)
+
+    def test_judge_rejects_blank_and_unknown_fields(self) -> None:
+        data = self._base()
+        data["judges"][0]["model"] = "  "
+        with pytest.raises(Exception):
+            load_config_from_dict(data)
+        data = self._base()
+        data["judges"][0]["fallback_models"] = ["x"]
+        with pytest.raises(Exception):
+            load_config_from_dict(data)
+
+    def test_duplicate_judge_ids_rejected(self) -> None:
+        data = self._base()
+        data["judges"].append(dict(data["judges"][0]))
+        with pytest.raises(Exception):
+            load_config_from_dict(data)
+
+    def test_timeout_must_be_positive_finite(self) -> None:
+        data = self._base()
+        data["judges"][0]["timeout"] = -1
+        with pytest.raises(Exception):
+            load_config_from_dict(data)

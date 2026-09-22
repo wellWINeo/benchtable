@@ -294,3 +294,52 @@ class TestPokerPlugin:
         game = PokerGame()
         ids = game.player_ids_from_config({"players": ["x", "y", "z"]})
         assert ids == ["x", "y", "z"]
+
+
+class TestMinMaxTurns:
+    """The optional ``min_max_turns`` plugin hook and registry accessor."""
+
+    def test_returns_plugin_value(self) -> None:
+        plugin = _StubPlugin("min-turns", "1.0")
+        plugin.min_max_turns = lambda game_config: 135  # type: ignore[method-assign]
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        assert registry.min_max_turns("min-turns", {}) == 135
+
+    def test_returns_none_when_hook_is_absent(self) -> None:
+        registry = GameRegistry()
+        registry.register(_StubPlugin("plain", "1.0"))
+
+        assert registry.min_max_turns("plain", {}) is None
+
+    def test_rejects_non_callable_hook(self) -> None:
+        plugin = _StubPlugin("min-turns", "1.0")
+        plugin.min_max_turns = "135"  # type: ignore[method-assign]
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        with pytest.raises(PluginError, match="min_max_turns"):
+            registry.min_max_turns("min-turns", {})
+
+    @pytest.mark.parametrize("value", ["135", 13.5, True, 0, -3])
+    def test_rejects_invalid_hook_results(self, value: object) -> None:
+        plugin = _StubPlugin("min-turns", "1.0")
+        plugin.min_max_turns = lambda game_config: value  # type: ignore[method-assign]
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        with pytest.raises(PluginError, match="integer >= 1"):
+            registry.min_max_turns("min-turns", {})
+
+    def test_wraps_hook_failures_in_plugin_error(self) -> None:
+        def _broken(game_config: object) -> int:
+            raise ValueError("boom")
+
+        plugin = _StubPlugin("min-turns", "1.0")
+        plugin.min_max_turns = _broken  # type: ignore[method-assign]
+        registry = GameRegistry()
+        registry.register(plugin)
+
+        with pytest.raises(PluginError, match="could not be read"):
+            registry.min_max_turns("min-turns", {})
