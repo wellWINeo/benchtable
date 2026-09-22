@@ -795,6 +795,15 @@ class SpyfallSession:
         )
         return GameResult(completed=self._match_over, outcome=outcome, metrics=metrics)
 
+    def handle_failed_turn(self, actor_id: str, reason: str) -> Transition:
+        winner_side = "non_spies" if actor_id == self._spy_id else "spy"
+        round_index = self._round_index
+        self._end_round(winner_side, f"failed_turn_{reason}")
+        return Transition(
+            summary=f"round {round_index + 1} ended by failed turn ({reason})",
+            metrics={"reason": reason, "winner_side": winner_side},
+        )
+
     def _queue_event(self, event_type: str, payload: dict[str, object]) -> None:
         self._events.append(cast(JsonObject, {"event_type": event_type, **payload}))
 

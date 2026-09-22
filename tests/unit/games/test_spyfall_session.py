@@ -924,3 +924,85 @@ def test_in_progress_result_contract() -> None:
     assert metrics["round_count"] == 0
     assert metrics["question_count"] == 1
     assert metrics["judge_invocations"] == 1
+
+
+def test_failed_non_spy_loses_round_and_next_round_begins() -> None:
+    session = make_session(rounds_per_match=2)
+    spy = spy_of(session)
+    non_spy = next(p for p in PLAYERS if p != spy)
+
+    transition = session.handle_failed_turn(non_spy, "invalid_attempts_exhausted")
+
+    assert transition.summary == (
+        "round 1 ended by failed turn (invalid_attempts_exhausted)"
+    )
+    assert transition.metrics == {
+        "reason": "invalid_attempts_exhausted",
+        "winner_side": "spy",
+    }
+    assert session.is_terminal is False
+    assert session.conversation_scope_id == "round-1"
+    result = session.get_result()
+    assert result.completed is False
+    assert result.outcome["rounds"] == [
+        {
+            "round_index": 0,
+            "winner_side": "spy",
+            "reason": "failed_turn_invalid_attempts_exhausted",
+        }
+    ]
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert points[spy] == 1
+    assert sum(points.values()) == 1
+
+
+def test_failed_spy_awards_non_spies() -> None:
+    session = make_session(rounds_per_match=2)
+    spy = spy_of(session)
+
+    transition = session.handle_failed_turn(spy, "provider_retries_exhausted")
+
+    assert transition.metrics == {
+        "reason": "provider_retries_exhausted",
+        "winner_side": "non_spies",
+    }
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[0]["winner_side"] == "non_spies"
+    assert rounds[0]["reason"] == "failed_turn_provider_retries_exhausted"
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    for player in PLAYERS:
+        assert points[player] == (0 if player == spy else 1)
+
+
+def test_final_round_failure_completes_match() -> None:
+    session = make_session(rounds_per_match=1)
+    spy = spy_of(session)
+    non_spy = next(p for p in PLAYERS if p != spy)
+
+    session.handle_failed_turn(non_spy, "memory_budget_exhausted")
+
+    assert session.is_terminal is True
+    result = session.get_result()
+    assert result.completed is True
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert len(rounds) == 1
+    assert rounds[0]["reason"] == "failed_turn_memory_budget_exhausted"
+
+
+def test_failed_turn_summary_is_public_safe() -> None:
+    session = make_session(rounds_per_match=2)
+    spy = spy_of(session)
+    non_spy = next(p for p in PLAYERS if p != spy)
+    location = known_location(session, non_spy)
+    assert location is not None
+
+    transition = session.handle_failed_turn(spy, "invalid_attempts_exhausted")
+
+    assert location not in transition.summary
+    assert spy not in transition.summary
+    assert "invalid_attempts_exhausted" in transition.summary
