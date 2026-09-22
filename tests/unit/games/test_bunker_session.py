@@ -162,6 +162,16 @@ def test_speak_validation_rejects_bad_actions() -> None:
     assert session.current_actor_id == "p2"
 
 
+def test_non_current_observation_names_the_scheduled_actor() -> None:
+    session = _session()
+
+    observation = session.get_observation("p2")
+
+    assert session.current_actor_id == "p1"
+    assert "Scheduled speaker this turn: p1." in observation.text
+    assert "Scheduled speaker this turn: p2." not in observation.text
+
+
 def test_rotation_and_ballot_phase_switch() -> None:
     session = _session()
     for expected_speaker in PLAYERS:
@@ -377,6 +387,16 @@ def _scripted_full_match(seed: int = 5) -> BunkerSession:
     _vote(session, "p3", "p1")
     _vote(session, "p4", "p3")
     return session
+
+
+def test_terminal_session_has_no_actions_or_actionable_instruction() -> None:
+    session = _scripted_full_match()
+
+    assert session.is_terminal
+    assert session.get_tools("p1") == []
+    observation = session.get_observation("p1")
+    assert "The match is over; no further actions are legal." in observation.text
+    assert "Call bunker_" not in observation.text
 
 
 def test_completed_result_contract() -> None:

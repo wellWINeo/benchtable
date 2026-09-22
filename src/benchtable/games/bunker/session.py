@@ -86,7 +86,6 @@ class BunkerSession:
 
         self._scenario = scenario
         self._capacity = shelter_capacity
-        self._seed = seed
         self._rng = random.Random(f"{seed}:bunker")
 
         self._dossiers: dict[str, dict[str, str]] = {pid: {} for pid in players}
@@ -136,6 +135,8 @@ class BunkerSession:
         return self._match_over
 
     def get_tools(self, actor_id: str) -> list[ToolSpec]:
+        if self._match_over:
+            return []
         if self._phase == "ballot":
             return [_vote_tool()]
         return [_speak_tool()]
@@ -149,10 +150,12 @@ class BunkerSession:
             f"Phase: {self._phase}.",
             f"Survivors: {', '.join(self._survivors)}.",
         ]
-        if self._phase == "ballot":
-            lines.append(f"Scheduled voter this turn: {actor_id}.")
+        if self._match_over:
+            lines.append("The match is over; no further actions are legal.")
+        elif self._phase == "ballot":
+            lines.append(f"Scheduled voter this turn: {self.current_actor_id}.")
         else:
-            lines.append(f"Scheduled speaker this turn: {actor_id}.")
+            lines.append(f"Scheduled speaker this turn: {self.current_actor_id}.")
 
         last_seen = self._last_seen.get(actor_id, 0)
         delivered = [
@@ -180,7 +183,9 @@ class BunkerSession:
             "Still unrevealed: " + (", ".join(remaining) if remaining else "none")
         )
 
-        if self._phase == "ballot":
+        if self._match_over:
+            pass
+        elif self._phase == "ballot":
             lines.append(
                 "Call bunker_vote_eliminate to cast your secret ballot against "
                 "one other surviving player. Abstention is not allowed."
