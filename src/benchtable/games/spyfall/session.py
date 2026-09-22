@@ -30,6 +30,16 @@ _ACCUSE_TOOL = "spyfall_accuse"
 _GUESS_TOOL = "spyfall_guess_location"
 _VOTE_TOOL = "spyfall_vote"
 
+LEAK_RUBRIC = (
+    "You are judging one public message from a game of Spyfall. The state names "
+    "the secret location. The candidate text is one public question or answer. "
+    "Estimate the probability that the candidate text discloses the secret "
+    "location to a reader who does not know it, either by naming it directly or "
+    "by an unambiguous identifying paraphrase. Describing details associated "
+    "with many possible locations is ordinary play, not disclosure."
+)
+_NON_JUDGED_TOOLS = (_ACCUSE_TOOL, _GUESS_TOOL, _VOTE_TOOL)
+
 
 class SpyfallSession:
     """Private session state machine for a Spyfall match."""
@@ -79,6 +89,10 @@ class SpyfallSession:
         self._round_index = 0
         self._match_over = False
         self._question_count = 0
+        self._judge_invocations = 0
+        self._leak_confirmations = 0
+        self._judge_failures = 0
+        self._judge_malformed_decisions = 0
         self._events: list[JsonObject] = []
 
         self._location = ""
@@ -292,10 +306,36 @@ class SpyfallSession:
     ) -> Transition:
         return self._apply(actor_id, tool_name, arguments)
 
+    def required_judge_ids(self) -> list[str]:
+        return [self._judge_id]
+
     def judgment_request(
         self, actor_id: str, tool_name: str, arguments: JsonObject
     ) -> JudgmentRequest | None:
-        return None
+        if tool_name in _NON_JUDGED_TOOLS:
+            return None
+        validated = self._validate_action(actor_id, tool_name, arguments)
+        kind = cast(str, validated["kind"])
+        if kind not in ("question", "answer"):
+            return None
+        return JudgmentRequest(
+            judge_id=self._judge_id,
+            judgment_kind="spyfall_leak",
+            payload=cast(
+                JsonObject,
+                {
+                    "state": {
+                        "secret_location": self._location,
+                        "candidate_kind": kind,
+                        "candidate_speaker": actor_id,
+                        "candidate_text": validated["text"],
+                    },
+                    "questions": {
+                        "leak": {"type": "noul", "instructions": LEAK_RUBRIC}
+                    },
+                },
+            ),
+        )
 
     def apply_judged_action(
         self,
@@ -304,7 +344,52 @@ class SpyfallSession:
         arguments: JsonObject,
         judgment: JudgmentOutcome | None,
     ) -> Transition:
+        if judgment is None or tool_name not in (_QUESTION_TOOL, _ANSWER_TOOL):
+            return self._apply(actor_id, tool_name, arguments)
+        if not judgment.ok:
+            self._judge_failures += 1
+            self._queue_event(
+                "judge_fail_open",
+                {
+                    "round_index": self._round_index,
+                    "judgment_kind": "spyfall_leak",
+                    "failure_reason": judgment.failure_reason,
+                },
+            )
+            return self._apply(actor_id, tool_name, arguments)
+        self._judge_invocations += 1
+        probability = self._leak_probability(judgment)
+        if probability is None:
+            self._judge_malformed_decisions += 1
+            return self._apply(actor_id, tool_name, arguments)
+        if probability >= self._judge_leak_threshold:
+            self._leak_confirmations += 1
+            round_index = self._round_index
+            self._end_round("spy", "spy_leak_judged")
+            return Transition(
+                summary=(
+                    "a judge confirmed a location leak in a public message; "
+                    "the round goes to the Spy"
+                ),
+                metrics={"round_index": round_index, "reason": "spy_leak_judged"},
+            )
         return self._apply(actor_id, tool_name, arguments)
+
+    @staticmethod
+    def _leak_probability(judgment: JudgmentOutcome) -> float | None:
+        decision = judgment.decision
+        if not isinstance(decision, dict):
+            return None
+        answers = decision.get("answers")
+        if not isinstance(answers, dict):
+            return None
+        leak = answers.get("leak")
+        if not isinstance(leak, dict):
+            return None
+        probability = leak.get("probability")
+        if type(probability) is not float or not 0.0 <= probability <= 1.0:
+            return None
+        return probability
 
     def _apply(
         self, actor_id: str, tool_name: str, arguments: JsonObject
@@ -317,7 +402,27 @@ class SpyfallSession:
             return self._apply_answer(actor_id, arguments)
         raise InvalidActionError(f"Unknown tool: {tool_name}")
 
-    def _apply_question(self, actor_id: str, arguments: JsonObject) -> Transition:
+    def _validate_action(
+        self, actor_id: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        """Validate the candidate action and return its normalized parameters."""
+        if self._match_over:
+            raise InvalidActionError("Match is already over")
+        if tool_name == _QUESTION_TOOL:
+            target, text = self._validate_question(actor_id, arguments)
+            return cast(
+                JsonObject, {"kind": "question", "target": target, "text": text}
+            )
+        if tool_name == _ANSWER_TOOL:
+            return cast(
+                JsonObject,
+                {"kind": "answer", "text": self._validate_answer(actor_id, arguments)},
+            )
+        raise InvalidActionError(f"Unknown tool: {tool_name}")
+
+    def _validate_question(
+        self, actor_id: str, arguments: JsonObject
+    ) -> tuple[str, str]:
         if self._phase != "question":
             raise InvalidActionError(
                 "Questions are only asked during the question phase"
@@ -334,7 +439,10 @@ class SpyfallSession:
             raise InvalidActionError("You cannot question yourself")
         if target not in self._players:
             raise InvalidActionError(f"Unknown question target: {target}")
-        text = self._require_public_text(arguments)
+        return target, self._require_public_text(arguments)
+
+    def _apply_question(self, actor_id: str, arguments: JsonObject) -> Transition:
+        target, text = self._validate_question(actor_id, arguments)
 
         self._dialogue.append(
             cast(
@@ -364,7 +472,7 @@ class SpyfallSession:
             metrics={"round_index": self._round_index, "phase": self._phase},
         )
 
-    def _apply_answer(self, actor_id: str, arguments: JsonObject) -> Transition:
+    def _validate_answer(self, actor_id: str, arguments: JsonObject) -> str:
         if self._phase != "answer":
             raise InvalidActionError("Answers are only given during the answer phase")
         if self._pending_target is None or actor_id != self._pending_target:
@@ -372,7 +480,10 @@ class SpyfallSession:
             raise InvalidActionError(
                 f"Not {actor_id}'s turn; the scheduled answerer is {expected}"
             )
-        text = self._require_public_text(arguments)
+        return self._require_public_text(arguments)
+
+    def _apply_answer(self, actor_id: str, arguments: JsonObject) -> Transition:
+        text = self._validate_answer(actor_id, arguments)
 
         self._dialogue.append(
             cast(
@@ -477,6 +588,10 @@ class SpyfallSession:
             {
                 "round_count": len(self._round_records),
                 "question_count": self._question_count,
+                "judge_invocations": self._judge_invocations,
+                "leak_confirmations": self._leak_confirmations,
+                "judge_failures": self._judge_failures,
+                "judge_malformed_decisions": self._judge_malformed_decisions,
                 "completed": self._match_over,
             },
         )

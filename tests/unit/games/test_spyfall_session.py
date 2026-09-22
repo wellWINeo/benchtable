@@ -6,8 +6,13 @@ import json
 
 import pytest
 
+from benchtable.contracts import JudgmentOutcome
 from benchtable.errors import InvalidActionError
-from benchtable.games.spyfall.session import SpyfallGame, SpyfallSession
+from benchtable.games.spyfall.session import (
+    LEAK_RUBRIC,
+    SpyfallGame,
+    SpyfallSession,
+)
 
 PLAYERS = ["p1", "p2", "p3"]
 LOCATIONS = ["airport", "library"]
@@ -275,13 +280,11 @@ def test_tools_expose_all_five_actions() -> None:
         assert names == TOOL_NAMES
 
 
-def test_judged_capability_exists_and_defers_to_task_nine() -> None:
+def test_apply_judged_action_with_none_judgment_applies_normally() -> None:
     session = make_session()
     questioner = session.current_actor_id
     target = next(p for p in PLAYERS if p != questioner)
     arguments: dict[str, object] = {"target_id": target, "text": "judged?"}
-
-    assert session.judgment_request(questioner, "spyfall_question", arguments) is None
 
     transition = session.apply_judged_action(
         questioner, "spyfall_question", arguments, None
@@ -336,3 +339,197 @@ def test_factory_surface() -> None:
     session = game.create_session(seed=7, game_config=config)
     assert session.conversation_scope_id == "round-0"
     assert {tool.name for tool in session.get_tools("p1")} == TOOL_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Leak judging policy (Task 9)
+# ---------------------------------------------------------------------------
+
+
+def judgment_outcome(probability: float | None, *, ok: bool = True) -> JudgmentOutcome:
+    if not ok:
+        return JudgmentOutcome(ok=False, failure_reason="provider_error")
+    assert probability is not None
+    return JudgmentOutcome(
+        ok=True,
+        decision={"answers": {"leak": {"probability": probability}}},
+        model="typesafe/jev-1.13",
+    )
+
+
+def any_known_location(session: SpyfallSession) -> str:
+    for player_id in PLAYERS:
+        location = known_location(session, player_id)
+        if location is not None:
+            return location
+    raise AssertionError("no non-Spy player found")
+
+
+def test_leak_at_threshold_ends_round_for_spy_without_publishing_text() -> None:
+    session = make_session(judge_leak_threshold=0.85)
+    spy = spy_of(session)
+    questioner = session.current_actor_id
+    target = next(p for p in PLAYERS if p != questioner)
+    text = "the venue is definitely the airport, right?"
+
+    transition = session.apply_judged_action(
+        questioner,
+        "spyfall_question",
+        {"target_id": target, "text": text},
+        judgment_outcome(0.85),
+    )
+
+    assert transition.metrics["reason"] == "spy_leak_judged"
+    assert session.is_terminal is True
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[-1] == {
+        "round_index": 0,
+        "winner_side": "spy",
+        "reason": "spy_leak_judged",
+    }
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert points[spy] == 1
+    assert text not in session.get_observation(spy).text
+    assert result.metrics["question_count"] == 0
+    assert result.metrics["judge_invocations"] == 1
+    assert result.metrics["leak_confirmations"] == 1
+
+
+def test_leak_below_threshold_applies_action_normally() -> None:
+    session = make_session(judge_leak_threshold=0.85)
+    questioner = session.current_actor_id
+    target = next(p for p in PLAYERS if p != questioner)
+    text = "how crowded does it get on weekends?"
+
+    session.apply_judged_action(
+        questioner,
+        "spyfall_question",
+        {"target_id": target, "text": text},
+        judgment_outcome(0.84),
+    )
+
+    assert session.current_actor_id == target
+    assert text in session.get_observation(target).text
+    metrics = session.get_result().metrics
+    assert metrics["judge_invocations"] == 1
+    assert metrics["leak_confirmations"] == 0
+
+
+def test_malformed_decision_applies_action_defensively() -> None:
+    session = make_session()
+    questioner = session.current_actor_id
+    target = next(p for p in PLAYERS if p != questioner)
+
+    session.apply_judged_action(
+        questioner,
+        "spyfall_question",
+        {"target_id": target, "text": "any question"},
+        JudgmentOutcome(
+            ok=True, decision={"answers": {"leak": {"probability": "very high"}}}
+        ),
+    )
+
+    assert session.current_actor_id == target
+    metrics = session.get_result().metrics
+    assert metrics["judge_malformed_decisions"] == 1
+    assert metrics["judge_invocations"] == 1
+
+
+def test_judge_failure_fails_open_and_records_event() -> None:
+    session = make_session()
+    questioner = session.current_actor_id
+    target = next(p for p in PLAYERS if p != questioner)
+
+    session.apply_judged_action(
+        questioner,
+        "spyfall_question",
+        {"target_id": target, "text": "an innocent question?"},
+        judgment_outcome(None, ok=False),
+    )
+
+    events = session.drain_hand_events()
+    fail_open = [e for e in events if e.event_type == "judge_fail_open"]
+    assert len(fail_open) == 1
+    assert fail_open[0].payload["failure_reason"] == "provider_error"
+    assert fail_open[0].payload["judgment_kind"] == "spyfall_leak"
+    assert fail_open[0].payload["round_index"] == 0
+    assert session.current_actor_id == target
+    metrics = session.get_result().metrics
+    assert metrics["judge_failures"] == 1
+    assert metrics["judge_invocations"] == 0
+
+
+def test_judgment_request_rejects_illegal_action_without_judgment() -> None:
+    session = make_session()
+    questioner = session.current_actor_id
+
+    with pytest.raises(InvalidActionError):
+        session.judgment_request(
+            questioner,
+            "spyfall_question",
+            {"target_id": "p2", "text": "x" * 601},
+        )
+
+    with pytest.raises(InvalidActionError):
+        session.judgment_request(
+            questioner,
+            "spyfall_question",
+            {"target_id": questioner, "text": "self question?"},
+        )
+
+
+def test_judgment_request_payload_shape() -> None:
+    session = make_session()
+    questioner = session.current_actor_id
+    location = any_known_location(session)
+
+    request = session.judgment_request(
+        questioner,
+        "spyfall_question",
+        {"target_id": "p2", "text": "is it noisy there?"},
+    )
+    assert request is not None
+    assert request.judge_id == "leak-judge"
+    assert request.judgment_kind == "spyfall_leak"
+    assert request.payload["questions"] == {
+        "leak": {"type": "noul", "instructions": LEAK_RUBRIC}
+    }
+    state = request.payload["state"]
+    assert isinstance(state, dict)
+    assert state["secret_location"] == location
+    assert state["candidate_kind"] == "question"
+    assert state["candidate_speaker"] == questioner
+    assert state["candidate_text"] == "is it noisy there?"
+
+    session.apply_action(
+        questioner,
+        "spyfall_question",
+        {"target_id": "p2", "text": "is it noisy there?"},
+    )
+    answer_request = session.judgment_request(
+        "p2", "spyfall_answer", {"text": "sometimes, in summer"}
+    )
+    assert answer_request is not None
+    answer_state = answer_request.payload["state"]
+    assert isinstance(answer_state, dict)
+    assert answer_state["candidate_kind"] == "answer"
+    assert answer_state["candidate_text"] == "sometimes, in summer"
+
+    assert (
+        session.judgment_request(questioner, "spyfall_accuse", {"target": "p2"}) is None
+    )
+    assert (
+        session.judgment_request(
+            questioner, "spyfall_guess_location", {"location": "airport"}
+        )
+        is None
+    )
+    assert session.judgment_request(questioner, "spyfall_vote", {"vote": "yes"}) is None
+
+
+def test_required_judge_ids_declares_configured_judge() -> None:
+    session = make_session(judge_id="my-judge")
+    assert session.required_judge_ids() == ["my-judge"]
