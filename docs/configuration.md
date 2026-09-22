@@ -269,3 +269,58 @@ be at least that value and the plugin enforces it: with three players, five
 rounds, and three question rotations the minimum is `5 * 3^2 * 3 = 135`, and
 `benchtable run` rejects smaller values before any provider request. Judge
 calls and finalization calls add provider requests but not engine turns.
+
+## Bunker `[run.game_config]`
+
+The first-party `bunker` plugin is a deterministic, Bunker-inspired survival
+selection game. Players hold private seeded dossiers, discuss and optionally
+reveal facts about themselves, and secretly vote in elimination rounds until
+the survivors fit the public shelter capacity. It rejects unknown keys and
+values that do not meet the constraints below. Bunker has
+`requires_exact_agent_ids = true`: configure one `[[agents]]` entry for every
+string in `players`, with exactly the same IDs and no extras.
+
+| Key | Type, default, and constraints | Effect |
+| --- | --- | --- |
+| `players` | Required list of strict nonblank strings. At least `4`, at most `8`, unique. | Defines the contestants and the required agent IDs. |
+| `scenario` | Required strict nonblank string. | Public crisis text shown to every player from match start. |
+| `shelter_capacity` | Required strict integer from `1` through one fewer than the player count. | Number of survivors the shelter admits; the match ends when the survivor count reaches it. |
+
+Dossiers are authored by this project: original, neutral values across the
+`profession`, `health`, `skill`, and `trait` categories, never copied from a
+commercial game, with sensitive real-world attributes deliberately excluded.
+The engine-provided match seed assigns dossiers and resolves vote ties, so an
+identical seed and configuration produce identical matches.
+
+Each elimination round runs one discussion phase, where every surviving
+player calls `bunker_speak` once (at most 500 characters, optionally revealing
+one still-hidden category of their own dossier), followed by a secret ballot
+in which every survivor calls `bunker_vote_eliminate` targeting another
+surviving player; abstention and self-voting are rejected. Only aggregate
+totals, the eliminated player, and whether a seeded tie break occurred become
+public. A game-attributable failed turn eliminates only the failed player for
+that round. Survivors at capacity win, and the result reports
+`completion_reason = "capacity_reached"`.
+
+Normal play needs exactly
+`player_count * (player_count + 1) - shelter_capacity * (shelter_capacity + 1)`
+engine turns: one discussion and one ballot action per survivor per
+elimination round. Eight players with capacity `1` need `70` turns. Configure
+`[run].max_turns` at least to that value plus any headroom; the CLI rejects
+lower values before constructing any agent by consulting the plugin's
+`min_max_turns` hook.
+
+For example, the configuration below needs `4 * 5 - 2 * 3 = 14` turns, so
+`max_turns = 20` leaves headroom:
+
+```toml
+[run]
+game = "bunker"
+matches = 1
+max_turns = 20
+
+[run.game_config]
+players = ["player-1", "player-2", "player-3", "player-4"]
+scenario = "sealed shelter after a solar storm"
+shelter_capacity = 2
+```
