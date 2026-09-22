@@ -201,7 +201,7 @@ class SpyfallSession:
         return [
             ToolSpec(
                 name=_QUESTION_TOOL,
-                description="Ask your public question this turn.",
+                description="Ask your question this turn.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -386,14 +386,13 @@ class SpyfallSession:
         )
         self._rotation_step += 1
         if self._rotation_step >= self._question_rounds * len(self._players):
+            round_index = self._round_index
+            rotation_step = self._rotation_step
             self._end_round("spy", "question_rotation_complete")
             return Transition(
                 summary=f"{actor_id} answers; the rotation ends and the round "
                 "goes to the Spy",
-                metrics={
-                    "round_index": self._round_index,
-                    "rotation_step": self._rotation_step,
-                },
+                metrics={"round_index": round_index, "rotation_step": rotation_step},
             )
         self._questioner_index = (self._questioner_index + 1) % len(self._players)
         self._pending_target = None
@@ -418,6 +417,8 @@ class SpyfallSession:
         return text
 
     def _end_round(self, winner_side: str, reason: str) -> None:
+        if winner_side not in ("spy", "non_spies"):
+            raise ValueError(f"Unknown round winner side: {winner_side}")
         if winner_side == "non_spies":
             winners = [p for p in self._players if p != self._spy_id]
         else:

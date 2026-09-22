@@ -240,6 +240,20 @@ def test_match_over_rejects_actions() -> None:
         )
 
 
+def test_round_completing_transition_reports_original_round() -> None:
+    session = make_session(rounds_per_match=2)
+    for _ in range(2):
+        play_exchange(session)
+    questioner = session.current_actor_id
+    target = next(p for p in PLAYERS if p != questioner)
+    session.apply_action(
+        questioner, "spyfall_question", {"target_id": target, "text": "last q?"}
+    )
+    transition = session.apply_action(target, "spyfall_answer", {"text": "last answer"})
+    assert transition.metrics == {"round_index": 0, "rotation_step": 3}
+    assert session.conversation_scope_id == "round-1"
+
+
 def test_conversation_scope_and_turn_context() -> None:
     session = make_session(rounds_per_match=2)
     assert session.conversation_scope_id == "round-0"
