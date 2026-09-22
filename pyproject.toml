@@ -25,6 +25,7 @@ packages = ["src/benchtable"]
 [project.entry-points."benchtable.games"]
 poker = "benchtable.games.poker.session:PokerGame"
 spyfall = "benchtable.games.spyfall.session:SpyfallGame"
+bunker = "benchtable.games.bunker.session:BunkerGame"
 
 [dependency-groups]
 dev = [
