@@ -1609,3 +1609,71 @@ class TestJudgeWiring:
         )
 
         assert result.exit_code == 0
+
+    def test_bunker_max_turns_below_closed_form_bound_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        cli.set_registry(None)
+
+        players = ", ".join(f'"player-{index}"' for index in range(1, 9))
+        cfg_path = tmp_path / "bunker.toml"
+        cfg_path.write_text(
+            f"""\
+            [run]
+            game = "bunker"
+            matches = 1
+            max_turns = 69
+
+            [run.game_config]
+            players = [{players}]
+            scenario = "sealed shelter after a solar storm"
+            shelter_capacity = 1
+
+            [[agents]]
+            id = "player-1"
+            model = "fake-model"
+            """
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 1
+        assert "run.max_turns=69" in result.output
+        assert "minimum 70" in result.output
+        assert "'bunker'" in result.output
+
+    def test_bunker_max_turns_meeting_bound_passes_turn_budget_validation(
+        self, tmp_path: Path
+    ) -> None:
+        cli.set_registry(None)
+
+        players = ", ".join(f'"player-{index}"' for index in range(1, 9))
+        cfg_path = tmp_path / "bunker.toml"
+        cfg_path.write_text(
+            f"""\
+            [run]
+            game = "bunker"
+            matches = 1
+            max_turns = 70
+
+            [run.game_config]
+            players = [{players}]
+            scenario = "sealed shelter after a solar storm"
+            shelter_capacity = 1
+
+            [[agents]]
+            id = "player-1"
+            model = "fake-model"
+            """
+        )
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(cfg_path), "--output", str(tmp_path / "out")],
+        )
+
+        assert result.exit_code == 1
+        assert "below the minimum" not in result.output

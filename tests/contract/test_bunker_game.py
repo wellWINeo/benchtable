@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from benchtable.contracts import GameResult, Observation, ToolSpec, Transition
 from benchtable.errors import InvalidActionError
@@ -53,6 +54,21 @@ class TestBunkerGameContract:
 
     def test_requires_exact_agent_ids(self, game: BunkerGame) -> None:
         assert game.requires_exact_agent_ids is True
+
+    def test_min_max_turns_closed_form_bound(self, game: BunkerGame) -> None:
+        assert game.min_max_turns(dict(CONFIG)) == 14
+        eight_players = {
+            "players": [f"player-{index}" for index in range(1, 9)],
+            "scenario": "sealed shelter after a solar storm",
+            "shelter_capacity": 1,
+        }
+        assert game.min_max_turns(eight_players) == 70
+
+    def test_min_max_turns_validates_game_config(self, game: BunkerGame) -> None:
+        invalid = dict(CONFIG)
+        invalid["shelter_capacity"] = len(CONFIG["players"])
+        with pytest.raises(ValidationError):
+            game.min_max_turns(invalid)
 
     def test_system_prompt_marks_discussion_untrusted(self, game: BunkerGame) -> None:
         prompt = game.system_prompt("player-1")

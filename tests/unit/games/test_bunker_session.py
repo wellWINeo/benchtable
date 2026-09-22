@@ -593,3 +593,20 @@ def test_failed_turn_for_eliminated_actor_returns_none() -> None:
     assert session.handle_failed_turn("p2", "provider_retries_exhausted") is None
     assert session.get_result().metrics["elimination_rounds"] == 1
     assert session._survivors == ["p1", "p3", "p4"]
+
+
+def test_failed_turn_after_match_terminal_returns_none() -> None:
+    session = _session()
+    for target in ("p2", "p3"):
+        survivors = list(session._survivors)
+        for speaker in survivors:
+            _speak(session, speaker)
+        for voter in survivors:
+            session.apply_action(
+                voter,
+                "bunker_vote_eliminate",
+                {"target_id": target if voter != target else survivors[0]},
+            )
+
+    assert session.is_terminal
+    assert session.handle_failed_turn("p1", "invalid_attempts_exhausted") is None

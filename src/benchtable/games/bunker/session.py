@@ -404,7 +404,7 @@ class BunkerSession:
 
     def handle_failed_turn(self, actor_id: str, reason: str) -> Transition | None:
         """Eliminate the failed player; the failure consumes this round."""
-        if actor_id not in self._survivors:
+        if self._match_over or actor_id not in self._survivors:
             return None
         round_index = self._round_index
         self._eliminate(
@@ -591,6 +591,13 @@ class BunkerGame:
 
     def validate_config(self, game_config: JsonObject) -> None:
         parse_bunker_config(game_config)
+
+    def min_max_turns(self, game_config: JsonObject) -> int:
+        """Closed-form lower bound for [run].max_turns under normal play."""
+        config = parse_bunker_config(game_config)
+        player_count = len(config.players)
+        capacity = config.shelter_capacity
+        return player_count * (player_count + 1) - capacity * (capacity + 1)
 
     def system_prompt(self, actor_id: str) -> str:
         return (
