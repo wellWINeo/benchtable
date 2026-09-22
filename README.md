@@ -139,3 +139,18 @@ enforced minimum `max_turns`) is documented in
 [docs/configuration.md](docs/configuration.md), and the judge calibration
 protocol plus its privacy implications are documented in
 [docs/spyfall-judge-calibration.md](docs/spyfall-judge-calibration.md).
+
+## Bunker
+
+Benchtable includes a first-party, deterministic, Bunker-inspired survival
+plugin. Players receive private seeded dossiers across the `profession`,
+`health`, `skill`, and `trait` categories, take one public statement per
+elimination round with an optional single-fact reveal, and then secretly vote
+to eliminate one player until the survivors fit the configured shelter
+capacity; vote ties break deterministically from the run seed, and a
+game-attributable failed turn eliminates only the failed player. Configure it
+through `[run.game_config]` with `players` (4–8), a public `scenario`, and a
+`shelter_capacity`; `[run].max_turns` must cover the closed-form turn bound,
+which the CLI enforces via the game's `min_max_turns` hook. See the
+[complete configuration reference](docs/configuration.md) for the full
+constraints and a worked example.
