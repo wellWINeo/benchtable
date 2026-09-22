@@ -824,3 +824,103 @@ def test_accuse_validation() -> None:
         fresh.apply_action("p1", "spyfall_accuse", {"target": "ghost"})
     with pytest.raises(InvalidActionError):  # missing target
         fresh.apply_action("p1", "spyfall_accuse", {})
+
+
+ALLOWED_ROUND_REASONS = {
+    "spy_leak_judged",
+    "question_rotation_complete",
+    "guess_correct",
+    "guess_incorrect",
+    "accusation_correct",
+    "accusation_incorrect",
+}
+
+RESULT_METRIC_KEYS = {
+    "round_count",
+    "question_count",
+    "accusation_count",
+    "votes_cast",
+    "judge_invocations",
+    "leak_confirmations",
+    "judge_failures",
+    "judge_malformed_decisions",
+    "completed",
+}
+
+
+def play_judged_exchange(session: SpyfallSession) -> None:
+    questioner = session.current_actor_id
+    target = next(p for p in PLAYERS if p != questioner)
+    session.apply_judged_action(
+        questioner,
+        "spyfall_question",
+        {"target_id": target, "text": "is it noisy there?"},
+        judgment_outcome(0.1),
+    )
+    session.apply_judged_action(target, "spyfall_answer", {"text": "sometimes"}, None)
+
+
+def test_completed_match_result_contract_rounds_points_and_reasons() -> None:
+    session = make_session(rounds_per_match=2)
+    round_spies = [spy_of(session)]
+    for _ in range(3):
+        play_exchange(session)
+    round_spies.append(spy_of(session))
+    for _ in range(3):
+        play_exchange(session)
+
+    assert session.is_terminal is True
+    result = session.get_result()
+    assert result.completed is True
+    assert set(result.outcome) == {"points", "rounds"}
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert [record["round_index"] for record in rounds] == [0, 1]
+    for record in rounds:
+        assert set(record) == {"round_index", "winner_side", "reason"}
+        assert record["winner_side"] in ("spy", "non_spies")
+        assert record["reason"] in ALLOWED_ROUND_REASONS
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert set(points) == set(PLAYERS)
+    for round_spy in set(round_spies):
+        assert points[round_spy] == round_spies.count(round_spy)
+    assert sum(points.values()) == 2
+
+
+def test_completed_match_metrics_contract() -> None:
+    session = make_session()
+    play_judged_exchange(session)
+    for _ in range(2):
+        play_exchange(session)
+
+    result = session.get_result()
+    assert result.completed is True
+    metrics = result.metrics
+    assert set(metrics) == RESULT_METRIC_KEYS
+    assert metrics["round_count"] == 1
+    assert metrics["question_count"] == 3
+    assert metrics["accusation_count"] == 0
+    assert metrics["votes_cast"] == 0
+    assert metrics["judge_invocations"] == 1
+    assert metrics["leak_confirmations"] == 0
+    assert metrics["judge_failures"] == 0
+    assert metrics["judge_malformed_decisions"] == 0
+    assert metrics["completed"] is True
+
+
+def test_in_progress_result_contract() -> None:
+    session = make_session()
+    play_judged_exchange(session)
+
+    assert session.is_terminal is False
+    result = session.get_result()
+    assert result.completed is False
+    assert set(result.outcome) == {"points", "rounds"}
+    assert result.outcome["rounds"] == []
+    metrics = result.metrics
+    assert set(metrics) == RESULT_METRIC_KEYS
+    assert metrics["completed"] is False
+    assert metrics["round_count"] == 0
+    assert metrics["question_count"] == 1
+    assert metrics["judge_invocations"] == 1
