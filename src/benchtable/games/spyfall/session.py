@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from typing import cast
 
@@ -89,6 +90,8 @@ class SpyfallSession:
         self._round_index = 0
         self._match_over = False
         self._question_count = 0
+        self._accusation_count = 0
+        self._votes_cast = 0
         self._judge_invocations = 0
         self._leak_confirmations = 0
         self._judge_failures = 0
@@ -102,6 +105,13 @@ class SpyfallSession:
         self._phase = "question"
         self._pending_target: str | None = None
         self._dialogue: list[JsonObject] = []
+        self._accuser = ""
+        self._accused = ""
+        self._eligible: list[str] = []
+        self._ballot_pointer = 0
+        self._votes_yes = 0
+        self._votes_no = 0
+        self._required_yes = 0
         self._begin_round()
 
     def _begin_round(self) -> None:
@@ -113,6 +123,13 @@ class SpyfallSession:
         self._phase = "question"
         self._pending_target = None
         self._dialogue = []
+        self._accuser = ""
+        self._accused = ""
+        self._eligible = []
+        self._ballot_pointer = 0
+        self._votes_yes = 0
+        self._votes_no = 0
+        self._required_yes = 0
         self._queue_event(
             "round_start",
             {
@@ -125,6 +142,8 @@ class SpyfallSession:
     def current_actor_id(self) -> str:
         if self._phase == "answer" and self._pending_target is not None:
             return self._pending_target
+        if self._phase == "ballot":
+            return self._eligible[self._ballot_pointer]
         return self._players[self._questioner_index]
 
     @property
@@ -192,6 +211,14 @@ class SpyfallSession:
         elif self._phase == "answer" and actor_id == self._pending_target:
             question = self._last_question_text()
             lines.append(f'Call spyfall_answer to answer the question: "{question}"')
+        elif self._phase == "ballot":
+            lines.append(
+                f"{self._accuser} accused {self._accused} of being the Spy. "
+                f"{self._ballot_pointer} of {len(self._eligible)} ballots cast; "
+                f"{self._required_yes} yes votes are required to convict."
+            )
+            if actor_id == scheduled:
+                lines.append("Call spyfall_vote to cast your secret ballot.")
         else:
             lines.append("It is not your turn; wait for the scheduled actor.")
 
@@ -400,6 +427,12 @@ class SpyfallSession:
             return self._apply_question(actor_id, arguments)
         if tool_name == _ANSWER_TOOL:
             return self._apply_answer(actor_id, arguments)
+        if tool_name == _ACCUSE_TOOL:
+            return self._apply_accuse(actor_id, arguments)
+        if tool_name == _GUESS_TOOL:
+            return self._apply_guess(actor_id, arguments)
+        if tool_name == _VOTE_TOOL:
+            return self._apply_vote(actor_id, arguments)
         raise InvalidActionError(f"Unknown tool: {tool_name}")
 
     def _validate_action(
@@ -527,6 +560,169 @@ class SpyfallSession:
             )
         return text
 
+    def _validate_accuse(self, actor_id: str, arguments: JsonObject) -> str:
+        if self._phase != "question":
+            raise InvalidActionError(
+                "Accusations are only made during the question phase"
+            )
+        scheduled = self._players[self._questioner_index]
+        if actor_id != scheduled:
+            raise InvalidActionError(
+                f"Not {actor_id}'s turn; the scheduled questioner is {scheduled}"
+            )
+        target = arguments.get("target")
+        if not isinstance(target, str):
+            raise InvalidActionError("Accusation requires a 'target' string")
+        if target == actor_id:
+            raise InvalidActionError("You cannot accuse yourself")
+        if target not in self._players:
+            raise InvalidActionError(f"Unknown accusation target: {target}")
+        return target
+
+    def _apply_accuse(self, actor_id: str, arguments: JsonObject) -> Transition:
+        target = self._validate_accuse(actor_id, arguments)
+
+        self._accuser = actor_id
+        self._accused = target
+        self._eligible = [p for p in self._players if p != target]
+        self._required_yes = math.ceil(
+            self._accusation_vote_threshold * len(self._eligible)
+        )
+        self._ballot_pointer = 0
+        self._votes_yes = 0
+        self._votes_no = 0
+        self._accusation_count += 1
+        self._phase = "ballot"
+        self._queue_event(
+            "accusation_opened",
+            {
+                "round_index": self._round_index,
+                "accuser": actor_id,
+                "accused": target,
+                "eligible_count": len(self._eligible),
+                "required_votes": self._required_yes,
+            },
+        )
+        return Transition(
+            summary=f"{actor_id} accuses {target}",
+            metrics={
+                "round_index": self._round_index,
+                "required_votes": self._required_yes,
+            },
+        )
+
+    def _validate_vote(self, actor_id: str, arguments: JsonObject) -> str:
+        if self._phase != "ballot":
+            raise InvalidActionError("Votes are only cast during the ballot phase")
+        scheduled = self._eligible[self._ballot_pointer]
+        if actor_id != scheduled:
+            raise InvalidActionError(
+                f"Not {actor_id}'s turn; the scheduled voter is {scheduled}"
+            )
+        vote = arguments.get("vote")
+        if vote not in ("yes", "no"):
+            raise InvalidActionError("Vote must be 'yes' or 'no'")
+        return cast(str, vote)
+
+    def _apply_vote(self, actor_id: str, arguments: JsonObject) -> Transition:
+        vote = self._validate_vote(actor_id, arguments)
+
+        if vote == "yes":
+            self._votes_yes += 1
+        else:
+            self._votes_no += 1
+        self._votes_cast += 1
+        self._ballot_pointer += 1
+        if self._ballot_pointer < len(self._eligible):
+            return Transition(
+                summary=f"{actor_id} cast a secret ballot",
+                metrics={
+                    "round_index": self._round_index,
+                    "ballots_remaining": len(self._eligible) - self._ballot_pointer,
+                },
+            )
+        return self._close_ballot()
+
+    def _close_ballot(self) -> Transition:
+        round_index = self._round_index
+        self._queue_event(
+            "vote_resolution",
+            {
+                "round_index": round_index,
+                "yes": self._votes_yes,
+                "no": self._votes_no,
+                "required": self._required_yes,
+                "convicted": self._votes_yes >= self._required_yes,
+            },
+        )
+        if self._votes_yes >= self._required_yes:
+            if self._accused == self._spy_id:
+                reason = "accusation_correct"
+                winner_side = "non_spies"
+            else:
+                reason = "accusation_incorrect"
+                winner_side = "spy"
+            self._end_round(winner_side, reason)
+            return Transition(
+                summary="the accusation was upheld",
+                metrics={"round_index": round_index, "reason": reason},
+            )
+        accuser_index = self._players.index(self._accuser)
+        self._rotation_step += 1
+        if self._rotation_step >= self._question_rounds * len(self._players):
+            self._end_round("spy", "question_rotation_complete")
+            return Transition(
+                summary="the accusation failed as the rotation ends; "
+                "the round goes to the Spy",
+                metrics={
+                    "round_index": round_index,
+                    "rotation_step": self._rotation_step,
+                },
+            )
+        self._questioner_index = (accuser_index + 1) % len(self._players)
+        self._pending_target = None
+        self._phase = "question"
+        return Transition(
+            summary="the accusation failed; play continues",
+            metrics={
+                "round_index": round_index,
+                "rotation_step": self._rotation_step,
+            },
+        )
+
+    def _validate_guess(self, actor_id: str, arguments: JsonObject) -> str:
+        if self._phase != "question":
+            raise InvalidActionError(
+                "Location guesses are only made during the question phase"
+            )
+        scheduled = self._players[self._questioner_index]
+        if actor_id != scheduled:
+            raise InvalidActionError(
+                f"Not {actor_id}'s turn; the scheduled questioner is {scheduled}"
+            )
+        if actor_id != self._spy_id:
+            raise InvalidActionError("Only the Spy may guess the location")
+        location = arguments.get("location")
+        if not isinstance(location, str) or not location.strip():
+            raise InvalidActionError("A nonblank 'location' is required")
+        return location
+
+    def _apply_guess(self, actor_id: str, arguments: JsonObject) -> Transition:
+        candidate = self._validate_guess(actor_id, arguments)
+
+        round_index = self._round_index
+        if candidate.strip().casefold() == self._location.casefold():
+            self._end_round("spy", "guess_correct")
+            return Transition(
+                summary="the location guess ended the round",
+                metrics={"round_index": round_index, "reason": "guess_correct"},
+            )
+        self._end_round("non_spies", "guess_incorrect")
+        return Transition(
+            summary="the location guess ended the round",
+            metrics={"round_index": round_index, "reason": "guess_incorrect"},
+        )
+
     def _end_round(self, winner_side: str, reason: str) -> None:
         if winner_side not in ("spy", "non_spies"):
             raise ValueError(f"Unknown round winner side: {winner_side}")
@@ -588,6 +784,8 @@ class SpyfallSession:
             {
                 "round_count": len(self._round_records),
                 "question_count": self._question_count,
+                "accusation_count": self._accusation_count,
+                "votes_cast": self._votes_cast,
                 "judge_invocations": self._judge_invocations,
                 "leak_confirmations": self._leak_confirmations,
                 "judge_failures": self._judge_failures,

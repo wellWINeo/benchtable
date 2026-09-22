@@ -533,3 +533,294 @@ def test_judgment_request_payload_shape() -> None:
 def test_required_judge_ids_declares_configured_judge() -> None:
     session = make_session(judge_id="my-judge")
     assert session.required_judge_ids() == ["my-judge"]
+
+
+# ---------------------------------------------------------------------------
+# Accusations, ballots, and the spy guess (Task 10)
+# ---------------------------------------------------------------------------
+
+
+def seed_where_spy(spy_id: str) -> int:
+    """Return a deterministic seed whose round-0 Spy is ``spy_id``."""
+    for seed in range(500):
+        if spy_of(make_session(seed=seed)) == spy_id:
+            return seed
+    raise AssertionError(f"no seed found with spy {spy_id}")
+
+
+def open_ballot(session: SpyfallSession, *, accuser: str, accused: str) -> None:
+    session.apply_action(accuser, "spyfall_accuse", {"target": accused})
+
+
+def cast_ballot(session: SpyfallSession, vote: str) -> None:
+    session.apply_action(session.current_actor_id, "spyfall_vote", {"vote": vote})
+
+
+def test_accusation_of_spy_convicts_non_spies() -> None:
+    session = make_session(seed=seed_where_spy("p2"))
+    assert session.current_actor_id == "p1"
+
+    open_ballot(session, accuser="p1", accused="p2")
+    assert session.current_actor_id == "p1"  # accuser is eligible and first
+
+    cast_ballot(session, "yes")
+    cast_ballot(session, "yes")
+
+    assert session.is_terminal is True
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[-1] == {
+        "round_index": 0,
+        "winner_side": "non_spies",
+        "reason": "accusation_correct",
+    }
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert points["p1"] == 1
+    assert points["p2"] == 0
+    assert points["p3"] == 1
+
+    events = session.drain_hand_events()
+    assert [event.event_type for event in events][-3:] == [
+        "vote_resolution",
+        "round_end",
+        "score_update",
+    ]
+    opened = events[1]
+    assert opened.event_type == "accusation_opened"
+    assert opened.payload == {
+        "round_index": 0,
+        "accuser": "p1",
+        "accused": "p2",
+        "eligible_count": 2,
+        "required_votes": 2,
+    }
+    resolution = events[-3]
+    assert resolution.payload == {
+        "round_index": 0,
+        "yes": 2,
+        "no": 0,
+        "required": 2,
+        "convicted": True,
+    }
+
+
+def test_wrong_conviction_awards_spy() -> None:
+    session = make_session(seed=seed_where_spy("p1"))
+
+    open_ballot(session, accuser="p1", accused="p2")
+    cast_ballot(session, "yes")
+    cast_ballot(session, "yes")
+
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[-1] == {
+        "round_index": 0,
+        "winner_side": "spy",
+        "reason": "accusation_incorrect",
+    }
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert points["p1"] == 1  # the spy side is the Spy alone
+    assert points["p2"] == 0
+    assert points["p3"] == 0
+
+
+def test_required_votes_use_ceil_arithmetic() -> None:
+    session = make_session(
+        players=["p1", "p2", "p3", "p4"],
+        accusation_vote_threshold=0.34,
+    )
+    roster = ["p1", "p2", "p3", "p4"]
+    spy = next(p for p in roster if known_location(session, p) is None)
+    accused = "p2" if spy != "p2" else "p3"
+
+    open_ballot(session, accuser="p1", accused=accused)
+    events = session.drain_hand_events()
+    opened = events[-1]
+    assert opened.event_type == "accusation_opened"
+    assert opened.payload["eligible_count"] == 3
+    assert opened.payload["required_votes"] == 2  # ceil(0.34 * 3)
+
+    cast_ballot(session, "yes")
+    cast_ballot(session, "no")
+    assert session.is_terminal is False  # 1 of 2 required votes
+    cast_ballot(session, "yes")
+
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[-1] == {
+        "round_index": 0,
+        "winner_side": "non_spies" if accused == spy else "spy",
+        "reason": "accusation_correct" if accused == spy else "accusation_incorrect",
+    }
+
+
+def test_non_convicting_ballot_consumes_accuser_slot() -> None:
+    session = make_session(rounds_per_match=2)
+
+    open_ballot(session, accuser="p1", accused="p2")
+    cast_ballot(session, "yes")
+    cast_ballot(session, "no")
+
+    assert session.is_terminal is False
+    assert session.current_actor_id == "p2"  # the player after the accuser
+    assert session.get_turn_context()["in_hand_turn"] == 1
+
+    events = session.drain_hand_events()
+    resolution = [e for e in events if e.event_type == "vote_resolution"]
+    assert len(resolution) == 1
+    assert resolution[0].payload == {
+        "round_index": 0,
+        "yes": 1,
+        "no": 1,
+        "required": 2,
+        "convicted": False,
+    }
+
+    play_exchange(session)
+    assert session.get_turn_context()["in_hand_turn"] == 2
+    play_exchange(session)
+
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[0] == {
+        "round_index": 0,
+        "winner_side": "spy",
+        "reason": "question_rotation_complete",
+    }
+
+
+def test_vote_eligibility_and_validation() -> None:
+    session = make_session(seed=seed_where_spy("p2"))
+
+    open_ballot(session, accuser="p1", accused="p2")
+
+    with pytest.raises(InvalidActionError):  # the accused cannot vote
+        session.apply_action("p2", "spyfall_vote", {"vote": "yes"})
+    with pytest.raises(InvalidActionError):  # unknown vote value
+        session.apply_action("p1", "spyfall_vote", {"vote": "maybe"})
+    with pytest.raises(InvalidActionError):  # out of turn
+        session.apply_action("p3", "spyfall_vote", {"vote": "yes"})
+
+    session.apply_action("p1", "spyfall_vote", {"vote": "yes"})
+    with pytest.raises(InvalidActionError):  # double voting
+        session.apply_action("p1", "spyfall_vote", {"vote": "yes"})
+
+    assert session.current_actor_id == "p3"
+    session.apply_action("p3", "spyfall_vote", {"vote": "no"})
+    assert session.current_actor_id == "p2"
+
+
+def test_ballot_secrecy_and_aggregate_only_publication() -> None:
+    session = make_session(seed=seed_where_spy("p2"))
+
+    open_ballot(session, accuser="p1", accused="p2")
+    voter = session.current_actor_id
+    assert voter == "p1"
+    observation = session.get_observation(voter)
+    assert "p1" in observation.text
+    assert "p2" in observation.text
+    assert "0 of 2 ballots cast" in observation.text
+    assert "yes votes are required" in observation.text
+
+    cast_ballot(session, "yes")
+    assert "1 of 2 ballots cast" in session.get_observation("p3").text
+    for player_id in PLAYERS:
+        text = session.get_observation(player_id).text
+        assert "voted yes" not in text.lower()
+        assert "voted no" not in text.lower()
+        assert "your vote" not in text.lower()
+
+    cast_ballot(session, "no")
+    events = session.drain_hand_events()
+    serialized = json.dumps([event.payload for event in events])
+    assert '"vote"' not in serialized
+    resolution = [e for e in events if e.event_type == "vote_resolution"]
+    assert len(resolution) == 1
+    assert resolution[0].payload["yes"] == 1
+    assert resolution[0].payload["no"] == 1
+
+
+def test_guess_is_spy_only_and_phase_gated() -> None:
+    session = make_session(seed=seed_where_spy("p1"))
+
+    with pytest.raises(InvalidActionError):  # non-Spy callers are rejected
+        session.apply_action("p2", "spyfall_guess_location", {"location": "airport"})
+
+    session.apply_action("p1", "spyfall_question", {"target_id": "p2", "text": "q?"})
+    with pytest.raises(InvalidActionError):  # not a question turn
+        session.apply_action("p1", "spyfall_guess_location", {"location": "airport"})
+
+
+def test_correct_guess_with_case_and_whitespace_awards_spy() -> None:
+    session = make_session(seed=seed_where_spy("p1"))
+    location = known_location(session, "p2")
+    assert location is not None
+
+    transition = session.apply_action(
+        "p1", "spyfall_guess_location", {"location": f"  {location.upper()} "}
+    )
+
+    assert session.is_terminal is True
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[-1] == {
+        "round_index": 0,
+        "winner_side": "spy",
+        "reason": "guess_correct",
+    }
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert points["p1"] == 1
+    assert points["p2"] == 0
+    assert points["p3"] == 0
+    assert "guess" in transition.summary.lower()
+
+
+def test_wrong_guess_awards_non_spies() -> None:
+    session = make_session(seed=seed_where_spy("p1"))
+
+    session.apply_action("p1", "spyfall_guess_location", {"location": "submarine"})
+
+    assert session.is_terminal is True
+    result = session.get_result()
+    rounds = result.outcome["rounds"]
+    assert isinstance(rounds, list)
+    assert rounds[-1] == {
+        "round_index": 0,
+        "winner_side": "non_spies",
+        "reason": "guess_incorrect",
+    }
+    points = result.outcome["points"]
+    assert isinstance(points, dict)
+    assert points["p2"] == 1
+    assert points["p3"] == 1
+    assert points["p1"] == 0
+
+
+def test_accuse_validation() -> None:
+    session = make_session()
+    questioner = session.current_actor_id
+    other = next(p for p in PLAYERS if p != questioner)
+
+    session.apply_action(
+        questioner, "spyfall_question", {"target_id": other, "text": "q?"}
+    )
+    with pytest.raises(InvalidActionError):  # not a question turn
+        session.apply_action(questioner, "spyfall_accuse", {"target": other})
+
+    fresh = make_session()
+    with pytest.raises(InvalidActionError):  # not the scheduled questioner
+        fresh.apply_action("p2", "spyfall_accuse", {"target": "p3"})
+    with pytest.raises(InvalidActionError):  # self-accusation
+        fresh.apply_action("p1", "spyfall_accuse", {"target": "p1"})
+    with pytest.raises(InvalidActionError):  # unknown target
+        fresh.apply_action("p1", "spyfall_accuse", {"target": "ghost"})
+    with pytest.raises(InvalidActionError):  # missing target
+        fresh.apply_action("p1", "spyfall_accuse", {})
