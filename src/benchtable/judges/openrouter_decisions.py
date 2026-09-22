@@ -17,6 +17,7 @@ from benchtable.errors import (
 from benchtable.judges.protocol import JudgeRequest, JudgmentDecision
 
 DEFAULT_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
+PINNED_DECISIONS_MODEL = "typesafe/jev-1.13"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
@@ -108,6 +109,11 @@ class OpenRouterDecisionsJudge:
     ) -> None:
         if type(model) is not str or not model.strip():
             raise ConfigurationError("Judge model must not be empty")
+        if model != PINNED_DECISIONS_MODEL:
+            raise ConfigurationError(
+                "The OpenRouter Decisions adapter supports only the pinned "
+                f"model '{PINNED_DECISIONS_MODEL}'"
+            )
         if base_url is not None and (type(base_url) is not str or not base_url.strip()):
             raise ConfigurationError("Judge base URL must not be empty")
         if type(api_key_env) is not str or not api_key_env.strip():

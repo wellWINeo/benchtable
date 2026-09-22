@@ -48,8 +48,9 @@ max_completion_tokens = 512                 # Optional completion-token limit.
 
 All keys in `[run]` other than `game` and `matches` have defaults. Integer
 fields below are strict integers: TOML booleans, strings, and floating-point
-values are rejected rather than coerced. The top level accepts only `run` and
-`agents`; unknown top-level keys and unknown `[run]` keys are rejected.
+values are rejected rather than coerced. The top level accepts only `run`,
+`agents`, and `judges`; unknown top-level keys and unknown `[run]` keys are
+rejected.
 
 | Key | Type, default, and constraints | Effect |
 | --- | --- | --- |

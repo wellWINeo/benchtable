@@ -223,3 +223,21 @@ def test_create_judge_rejects_unknown_adapter() -> None:
         JudgeConfig.model_validate(
             {"id": "j", "model": MODEL, "adapter": "unknown_adapter"}
         )
+
+
+def test_construction_rejects_unpinned_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(API_KEY_ENV, "test-key")
+    for model in ("typesafe/jev-1.12", "openai/gpt-4o", " typesafe/jev-1.13"):
+        with pytest.raises(ConfigurationError, match="pinned"):
+            OpenRouterDecisionsJudge(
+                judge_id="spyfall-leak-judge",
+                model=model,
+                api_key_env=API_KEY_ENV,
+                _post=FakeTransport(),
+            )
+
+
+def test_construction_accepts_pinned_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(API_KEY_ENV, "test-key")
+    judge = _judge(FakeTransport())
+    assert judge.judge_id == "spyfall-leak-judge"
